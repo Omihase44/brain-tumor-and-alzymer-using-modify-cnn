@@ -1162,6 +1162,7 @@
     <script>
         let currentUser = null;
         let currentReportId = null;
+        let currentReportData = null;
         let chatPartnerId = null;
         let currentChatUsers = [];
         let socket = null;
@@ -1426,6 +1427,7 @@
                 const response = await fetch(`/api/doctor/report/${reportId}`);
                 const data = await response.json();
                 const report = data.report;
+                currentReportData = report;
                 const detailedInfo = coerceObject(report.detailed_info);
                 const tumorDetails = resolveTumorDetails(report);
                 const modelAccuracy = resolveTumorMetricLabel(report, 'accuracy');
@@ -1482,7 +1484,12 @@
                     <div class="info-card">
                         <h6><i class="fas fa-stethoscope me-2"></i>Doctor's Review</h6>
                         <div class="mb-3">
-                            <label class="form-label">Doctor's Notes *</label>
+                            <div class="d-flex justify-content-between align-items-center mb-2">
+                                <label class="form-label mb-0">Doctor's Notes *</label>
+                                <button type="button" class="btn btn-sm btn-outline-primary" onclick="applyAiAssistNote()">
+                                    AI Assist
+                                </button>
+                            </div>
                             <textarea class="form-control" id="doctorNotes" rows="3" placeholder="Add your professional observations and diagnosis...">${report.doctor_notes || ''}</textarea>
                         </div>
                         <div class="mb-3">
@@ -1536,6 +1543,7 @@
                 const result = await response.json();
                 if (result.success) {
                     showAlert('Report saved as draft!', 'success');
+                    currentReportData = {...(currentReportData || {}), ...(result.report || {}), report_ready: false, download_enabled: false};
                     bootstrap.Modal.getInstance(document.getElementById('reportModal')).hide();
                     loadPatients();
                     loadPendingReports();
@@ -1569,7 +1577,13 @@
                 });
                 const result = await response.json();
                 if (result.success) {
-                    showAlert('Report approved and sent to patient!', 'success');
+                    showAlert('Report submitted and generated successfully!', 'success');
+                    currentReportData = {
+                        ...(currentReportData || {}),
+                        ...(result.report || {}),
+                        report_ready: true,
+                        download_enabled: true
+                    };
                     bootstrap.Modal.getInstance(document.getElementById('reportModal')).hide();
                     loadPatients();
                     loadPendingReports();
@@ -1602,6 +1616,12 @@
                 const result = await response.json();
                 if (result.success) {
                     showAlert('Report rejected', 'warning');
+                    currentReportData = {
+                        ...(currentReportData || {}),
+                        ...(result.report || {}),
+                        report_ready: false,
+                        download_enabled: false
+                    };
                     bootstrap.Modal.getInstance(document.getElementById('reportModal')).hide();
                     loadPatients();
                     loadPendingReports();
@@ -1690,17 +1710,10 @@
         }
 
         function resolveTumorMetricLabel(report, metricKey) {
-            const tumorDetails = resolveTumorDetails(report);
-            const metrics = coerceObject(tumorDetails.metrics);
-            const labelKey = `${metricKey}_label`;
-            const reportValue = metricKey === 'accuracy' ? report.model_accuracy : null;
-            if (metrics[labelKey]) {
-                return metrics[labelKey];
+            if (metricKey !== 'accuracy') {
+                return 'N/A';
             }
-            if (Number.isFinite(Number(metrics[metricKey]))) {
-                return formatConfidence(metrics[metricKey]);
-            }
-            return (metricKey === 'accuracy' ? reportValue : null) || 'N/A';
+            return report.model_accuracy || report.analysis?.model_accuracy || 'N/A';
         }
 
         function renderInsightStat(label, value, detail = '') {
@@ -1727,14 +1740,11 @@
             const reportImages = coerceObject(report.report_images);
             const tumorDetails = resolveTumorDetails(report);
             const modelAccuracy = resolveTumorMetricLabel(report, 'accuracy');
-            const precision = resolveTumorMetricLabel(report, 'precision');
-            const recall = resolveTumorMetricLabel(report, 'recall');
-            const f1Score = resolveTumorMetricLabel(report, 'f1_score');
             const alzheimerStage = report.analysis?.alzheimers?.stage || report.alzheimer_stage || report.alz_stage || 'N/A';
             const contourCount = segmentation.contour_count || 0;
-            const maskQuality = insights.mask_quality || segmentation.mask_quality || 'Unavailable';
+            const boundaryStatus = insights.boundary_status || (contourCount ? 'Detected' : 'Unavailable');
             const overlaySource = resolveImageSource(
-                reportImages.segmentation_overlay || report.segmentation_overlay || report.segmentation_image
+                reportImages.boundary_image || report.boundary_image || report.segmentation_overlay || report.segmentation_image
             );
             const volumeLabel = tumorDetails.volume ? `${tumorDetails.volume} mm3` : '0 mm3';
             const confidenceDetail = tumorDetails.detected
@@ -1752,22 +1762,19 @@
                         ${renderInsightStat('Tumor Stage', tumorDetails.stage || 'N/A', tumorDetails.detected ? 'WHO Grade I-IV estimate' : 'Staging not applicable')}
                         ${renderInsightStat('Alzheimer Stage', alzheimerStage, 'Neurocognitive staging output from the classifier')}
                         ${renderInsightStat('Tumor Confidence', formatConfidence(tumorDetails.confidence), confidenceDetail)}
-                        ${renderInsightStat('Model Accuracy', modelAccuracy, precision !== 'N/A' || recall !== 'N/A' || f1Score !== 'N/A' ? `Precision ${precision} | Recall ${recall} | F1 ${f1Score}` : 'Training metrics will appear after evaluation')}
-                        ${renderInsightStat('Tumor Volume', volumeLabel, `Mask quality: ${maskQuality}`)}
+                        ${renderInsightStat('Model Accuracy', modelAccuracy, 'Loaded from the latest saved training metrics')}
+                        ${renderInsightStat('Tumor Volume', volumeLabel, 'Estimated from the detected contour region')}
                         ${renderInsightStat('Boundary Overlay', contourCount ? `${contourCount} detected` : 'Unavailable', boundaryDetail)}
                     </div>
                     <div class="metric-pill-row">
-                        ${renderMetricPill('Precision', precision)}
-                        ${renderMetricPill('Recall', recall)}
-                        ${renderMetricPill('F1 Score', f1Score)}
-                        ${renderMetricPill('Mask Quality', maskQuality)}
-                        ${renderMetricPill('Boundary', insights.segmentation_boundary || (contourCount ? 'Detected' : 'Unavailable'))}
+                        ${renderMetricPill('Boundary', boundaryStatus)}
+                        ${renderMetricPill('Contours', contourCount ? String(contourCount) : 'Unavailable')}
                     </div>
                     ${overlaySource ? `
                         <div class="segmentation-boundary-preview">
                             <img src="${overlaySource}" alt="Segmentation boundary overlay">
                             <div class="segmentation-boundary-caption">
-                                Segmentation overlay with tumor boundary highlighted on the original MRI for clinical review.
+                                Boundary image with the tumor contour highlighted on the original MRI for clinical review.
                             </div>
                         </div>
                     ` : ''}
@@ -1821,10 +1828,9 @@
             const reportImages = report.report_images || {};
             const imageEntries = [
                 {label: 'Input Image', value: reportImages.input_image || report.input_image || report.image},
-                {label: 'Original MRI', value: reportImages.original_mri || report.original_mri || report.original_image},
-                {label: 'Enhanced MRI', value: reportImages.enhanced_mri || report.enhanced_mri || report.enhanced_image},
-                {label: 'Segmentation Overlay (Boundary)', value: reportImages.segmentation_overlay || report.segmentation_overlay || report.segmentation_image},
-                {label: 'Segmentation Mask', value: reportImages.segmentation_mask || report.segmentation_mask}
+                {label: 'Enhanced MRI', value: reportImages.enhanced_image || report.enhanced_image || report.enhanced_mri},
+                {label: 'Segmentation Mask', value: reportImages.mask_image || report.mask_image || report.segmentation_mask},
+                {label: 'Boundary Image', value: reportImages.boundary_image || report.boundary_image || report.segmentation_overlay || report.segmentation_image}
             ].filter((entry) => entry.value);
 
             if (!imageEntries.length) {
@@ -1846,6 +1852,39 @@
                     </div>
                 </div>
             `;
+        }
+
+        async function applyAiAssistNote() {
+            if (!currentReportData) {
+                return;
+            }
+
+            try {
+                const response = await fetch(`/api/doctor/report/${currentReportId}/ai-assist`);
+                const result = await response.json();
+                if (!result.success) {
+                    showAlert(result.error || 'AI Assist failed', 'danger');
+                    return;
+                }
+
+                const assist = result.ai_assist || {};
+                const notesField = document.getElementById('doctorNotes');
+                const prescriptionField = document.getElementById('prescription');
+                const followUpField = document.getElementById('followUp');
+
+                if (notesField) {
+                    notesField.value = assist.doctor_notes || '';
+                }
+                if (prescriptionField) {
+                    prescriptionField.value = assist.prescription || '';
+                }
+                if (followUpField) {
+                    followUpField.value = assist.follow_up || '';
+                }
+                showAlert('AI Assist filled the draft fields.', 'success');
+            } catch (error) {
+                showAlert('AI Assist failed', 'danger');
+            }
         }
 
         function setupSocket() {

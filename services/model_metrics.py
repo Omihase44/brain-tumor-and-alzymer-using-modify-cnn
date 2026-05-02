@@ -30,6 +30,49 @@ def _read_json_file(path: str) -> dict:
     return payload if isinstance(payload, dict) else {}
 
 
+def _load_metrics_from_metadata(metadata_payload: dict) -> dict:
+    if not isinstance(metadata_payload, dict):
+        return {}
+
+    raw_metrics = metadata_payload.get("metrics")
+    if isinstance(raw_metrics, dict) and raw_metrics:
+        return raw_metrics
+
+    metrics_path = metadata_payload.get("metrics_path")
+    if metrics_path:
+        metrics_payload = _read_json_file(_resolve_path(metrics_path, DEFAULT_MODEL_ACCURACY_PATH))
+        if metrics_payload:
+            return metrics_payload
+    return {}
+
+
+def _load_metrics_from_manifest_entry(manifest_entry: dict) -> dict:
+    if not isinstance(manifest_entry, dict):
+        return {}
+
+    metadata_path = manifest_entry.get("metadata_path")
+    if metadata_path:
+        metadata_payload = _read_json_file(_resolve_path(metadata_path, DEFAULT_MODEL_ACCURACY_PATH))
+        metrics_payload = _load_metrics_from_metadata(metadata_payload)
+        if metrics_payload:
+            return {
+                **metrics_payload,
+                "_metrics_source": "metadata",
+            }
+
+    model_path = manifest_entry.get("path")
+    if model_path:
+        resolved_model_path = _resolve_path(model_path, DEFAULT_MODEL_ACCURACY_PATH)
+        candidate_metrics_path = os.path.join(os.path.dirname(resolved_model_path), "model_metrics.json")
+        metrics_payload = _read_json_file(candidate_metrics_path)
+        if metrics_payload:
+            return {
+                **metrics_payload,
+                "_metrics_source": "model_metrics_file",
+            }
+    return {}
+
+
 def _normalize_metric_value(value) -> Optional[float]:
     if value in (None, ""):
         return None
@@ -78,20 +121,23 @@ def clear_model_metrics_cache() -> None:
 
 
 def get_model_metrics(model_key: str, registry_key: Optional[str] = None) -> Dict[str, object]:
-    manifest = _load_manifest()
-    manifest_entry = manifest.get(model_key) if isinstance(manifest, dict) else {}
     metrics_payload = {}
     source = "unavailable"
+    explicit_accuracy_registry = bool(os.environ.get("MODEL_ACCURACY_PATH", "").strip())
 
-    metadata_path = None
-    if isinstance(manifest_entry, dict):
-        metadata_path = manifest_entry.get("metadata_path")
-    if metadata_path:
-        metadata_payload = _read_json_file(_resolve_path(metadata_path, DEFAULT_MODEL_MANIFEST_PATH))
-        raw_metrics = metadata_payload.get("metrics")
-        if isinstance(raw_metrics, dict):
-            metrics_payload = raw_metrics
-            source = "metadata"
+    if explicit_accuracy_registry:
+        registry = _load_accuracy_registry()
+        registry_payload = registry.get(registry_key or model_key)
+        if isinstance(registry_payload, dict):
+            metrics_payload = registry_payload
+            source = "accuracy_registry"
+
+    manifest = _load_manifest()
+    manifest_entry = manifest.get(model_key) if isinstance(manifest, dict) else {}
+    if not metrics_payload and isinstance(manifest_entry, dict):
+        metrics_payload = _load_metrics_from_manifest_entry(manifest_entry)
+        if metrics_payload:
+            source = str(metrics_payload.get("_metrics_source") or "model_metrics_file")
 
     if not metrics_payload:
         registry = _load_accuracy_registry()

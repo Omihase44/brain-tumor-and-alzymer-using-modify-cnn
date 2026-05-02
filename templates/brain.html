@@ -2,19 +2,38 @@
 <html>
 <head>
     <title>Brain Detection</title>
-    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+    {% load static %}
+    <link rel="stylesheet" href="{% static 'style.css' %}">
 </head>
 <body>
 
 <h2>Brain Tumor Detection</h2>
 
 <form method="POST" enctype="multipart/form-data">
-    <input type="file" name="file" required><br><br>
-    <button type="submit">Predict</button>
+    {% csrf_token %}
+    <label for="name">Name:</label>
+    <input type="text" name="name" required><br><br>
+
+    <label for="age">Age:</label>
+    <input type="number" name="age" required><br><br>
+
+    <label for="contact">Contact:</label>
+    <input type="text" name="contact" required><br><br>
+
+    <label for="email">Email:</label>
+    <input type="email" name="emailid" required><br><br>
+
+    <label for="username">Username:</label>
+    <input type="text" name="Username" required><br><br>
+
+    <label for="image">MRI Image:</label>
+    <input type="file" name="Image1" accept="image/*" required><br><br>
+
+    <button type="submit">Analyze Brain Tumor</button>
 </form>
 
 <br>
-<a href="/">Back</a>
+<a href="/">Back to Home</a>
 
 </body>
 </html>

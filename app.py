@@ -1,6 +1,7 @@
 from flask import Flask, render_template, request, jsonify, session, redirect, url_for, flash, send_file, send_from_directory
 from flask_cors import CORS
 from functools import wraps
+import logging
 import os
 from werkzeug.utils import secure_filename
 import base64
@@ -20,7 +21,7 @@ from routes.appointment_routes import create_appointment_blueprint, register_app
 from routes.chat_routes import create_chat_blueprint, register_chat_socketio
 from services.data_store import bootstrap_platform_data, init_platform_database, sync_reports_to_db, sync_users_to_db
 from services.model_registry import get_model_registry
-from services.report_generator import build_medical_report_pdf
+from services.reporting import build_medical_report_pdf, build_report_context
 from socket_handler import emit_report_status_updated, emit_scan_uploaded
 
 try:
@@ -42,6 +43,9 @@ except ImportError:  # pragma: no cover - startup fallback until dependency is i
             return app.run(*args, **kwargs)
 
 BASE_DIR = os.path.abspath(os.path.dirname(__file__))
+logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
+LOGGER = logging.getLogger("neurodetect")
+logging.getLogger('werkzeug').setLevel(logging.ERROR)
 
 
 def _resolve_runtime_path(env_key, default_name):
@@ -74,6 +78,8 @@ CHAT_MEDIA_FOLDER = os.path.join(UPLOAD_FOLDER, "chat_media")
 ALLOWED_EXTENSIONS = {'png', 'jpg', 'jpeg', 'gif', 'bmp', 'dcm', 'dicom'}
 USERS_FILE = _resolve_runtime_path("USERS_FILE", "users.json")
 REPORTS_FILE = _resolve_runtime_path("REPORTS_FILE", "reports.json")
+REPORTS_DB_FILE = _resolve_runtime_path("REPORTS_DB_FILE", "reports_db.json")
+REPORTS_OUTPUT_DIR = _resolve_runtime_path("REPORTS_OUTPUT_DIR", "reports")
 PATIENT_DETAILS_FILE = _resolve_runtime_path("PATIENT_DETAILS_FILE", "patient_details.json")
 CHAT_DB_PATH = _resolve_runtime_path("CHAT_DB_PATH", "chat_store.sqlite3")
 APPOINTMENT_DB_PATH = _resolve_runtime_path("APPOINTMENT_DB_PATH", "appointment_store.sqlite3")
@@ -81,6 +87,7 @@ PLATFORM_DB_PATH = _resolve_runtime_path("PLATFORM_DB_PATH", "platform_store_run
 DATA_SEED_FILES = (
     (USERS_FILE, {"doctors": [], "patients": []}),
     (REPORTS_FILE, []),
+    (REPORTS_DB_FILE, []),
     (PATIENT_DETAILS_FILE, {}),
 )
 
@@ -89,9 +96,12 @@ app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024
 app.config['CHAT_DB_PATH'] = CHAT_DB_PATH
 app.config['APPOINTMENT_DB_PATH'] = APPOINTMENT_DB_PATH
 app.config['PLATFORM_DB_PATH'] = PLATFORM_DB_PATH
+app.config['REPORTS_DB_FILE'] = REPORTS_DB_FILE
+app.config['REPORTS_OUTPUT_DIR'] = REPORTS_OUTPUT_DIR
 
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 os.makedirs(CHAT_MEDIA_FOLDER, exist_ok=True)
+os.makedirs(REPORTS_OUTPUT_DIR, exist_ok=True)
 for seed_path, default_value in DATA_SEED_FILES:
     _ensure_json_file(seed_path, default_value)
 init_platform_database(PLATFORM_DB_PATH)
@@ -116,6 +126,15 @@ def normalize_text(value):
 
 def usernames_match(left, right):
     return normalize_text(left) == normalize_text(right)
+
+
+def normalize_detection_type(value):
+    normalized = normalize_text(value).lower()
+    if normalized in {'alz', 'alzheimer', 'alzheimers', "alzheimer's"}:
+        return 'alz'
+    if normalized in {'combined', 'both', 'all'}:
+        return 'combined'
+    return 'brain'
 
 
 def format_confidence_percentage(value):
@@ -265,6 +284,362 @@ def normalize_analysis_payload(analysis):
     return analysis
 
 
+def resolve_accuracy_label(value=None, metrics=None):
+    label = format_confidence_percentage(value)
+    if label not in (None, "", "Unavailable"):
+        return label
+
+    metrics_payload = normalize_metric_payload(_coerce_dict(metrics))
+    return _first_non_empty(
+        metrics_payload.get('accuracy_label'),
+        format_confidence_percentage(metrics_payload.get('accuracy')),
+        label,
+        'Unavailable',
+    )
+
+
+def build_filtered_ai_result_payload(analysis, detection_type=None):
+    analysis = normalize_analysis_payload(analysis)
+    tumor_payload = _coerce_dict(analysis.get('tumor'))
+    alzheimers_payload = _coerce_dict(analysis.get('alzheimers'))
+    normalized_type = normalize_text(detection_type or analysis.get('analysis_type')).lower()
+
+    tumor_result = {
+        'type': 'Brain Tumor',
+        'result': 'Detected' if tumor_payload.get('detected') else 'Not Detected',
+        'tumor_type': tumor_payload.get('tumor_type') or tumor_payload.get('classification') or 'No Tumor',
+        'tumor_stage': tumor_payload.get('tumor_stage') or tumor_payload.get('grade') or 'N/A',
+        'confidence': format_confidence_percentage(tumor_payload.get('confidence')) or 'N/A',
+        'model_accuracy': resolve_accuracy_label(
+            analysis.get('model_accuracy'),
+            tumor_payload.get('model_metrics'),
+        ),
+    }
+    alzheimer_result = {
+        'type': 'Alzheimer',
+        'stage': alzheimers_payload.get('stage') or analysis.get('alzheimer_stage') or 'NonDemented',
+        'confidence': format_confidence_percentage(alzheimers_payload.get('confidence')) or 'N/A',
+        'model_accuracy': resolve_accuracy_label(
+            _first_non_empty(
+                normalize_metric_payload(_coerce_dict(alzheimers_payload.get('model_metrics'))).get('accuracy_label'),
+                analysis.get('model_accuracy'),
+            ),
+            alzheimers_payload.get('model_metrics'),
+        ),
+    }
+
+    if normalized_type in {'brain', 'tumor', 'brain tumor'}:
+        return tumor_result
+    if normalized_type in {'alz', 'alzheimer', 'alzheimers', "alzheimer's"}:
+        return alzheimer_result
+    return {
+        'brain_tumor': tumor_result,
+        'alzheimer': alzheimer_result,
+    }
+
+
+def build_public_analysis_payload(report):
+    report = normalize_report_record(report)
+    analysis = _coerce_dict(report.get('analysis'))
+    tumor_payload = _coerce_dict(analysis.get('tumor'))
+    alzheimers_payload = _coerce_dict(analysis.get('alzheimers'))
+    segmentation_payload = _coerce_dict(analysis.get('segmentation'))
+    insights_payload = _coerce_dict(report.get('ai_clinical_insights')) or _coerce_dict(analysis.get('ai_clinical_insights'))
+    contour_count = int(segmentation_payload.get('contour_count') or 0)
+
+    return {
+        'tumor': {
+            'detected': bool(tumor_payload.get('detected', report.get('tumor_detected'))),
+            'classification': tumor_payload.get('classification') or report.get('tumor_type') or report.get('result'),
+            'tumor_type': tumor_payload.get('tumor_type') or report.get('tumor_type'),
+            'grade': tumor_payload.get('grade') or report.get('tumor_stage'),
+            'tumor_stage': tumor_payload.get('tumor_stage') or report.get('tumor_stage'),
+            'confidence': format_confidence_percentage(tumor_payload.get('confidence')) or report.get('tumor_confidence'),
+        },
+        'alzheimers': {
+            'detected': bool(alzheimers_payload.get('detected', report.get('alzheimer_detected'))),
+            'stage': alzheimers_payload.get('stage') or report.get('alzheimer_stage'),
+            'confidence': format_confidence_percentage(alzheimers_payload.get('confidence')) or report.get('alzheimer_confidence'),
+        },
+        'segmentation': {
+            'available': bool(report.get('boundary_image') or report.get('mask_image')),
+            'backend': segmentation_payload.get('backend') or 'opencv_contour',
+            'contour_count': contour_count,
+            'bounding_box': segmentation_payload.get('bounding_box'),
+            'white_pixel_count': segmentation_payload.get('white_pixel_count'),
+            'tumor_area_percentage': segmentation_payload.get('tumor_area_percentage'),
+            'tumor_area_mm2': segmentation_payload.get('tumor_area_mm2'),
+            'mask_quality': segmentation_payload.get('mask_quality'),
+            'mask_image': _first_non_empty(
+                segmentation_payload.get('mask_image'),
+                report.get('mask_image'),
+                _coerce_dict(report.get('report_images')).get('mask_image'),
+            ),
+            'boundary_image': _first_non_empty(
+                segmentation_payload.get('boundary_image'),
+                report.get('boundary_image'),
+                _coerce_dict(report.get('report_images')).get('boundary_image'),
+            ),
+        },
+        'ai_clinical_insights': {
+            'tumor_type': report.get('tumor_type'),
+            'tumor_stage': report.get('tumor_stage'),
+            'tumor_confidence': report.get('tumor_confidence'),
+            'alzheimer_stage': report.get('alzheimer_stage'),
+            'model_accuracy': report.get('model_accuracy'),
+            'boundary_status': _first_non_empty(
+                insights_payload.get('boundary_status'),
+                insights_payload.get('segmentation_boundary'),
+                'Detected' if contour_count else 'Unavailable',
+            ),
+        },
+        'model_accuracy': report.get('model_accuracy'),
+        'confidence': report.get('ai_confidence'),
+    }
+
+
+def build_public_report_payload(report):
+    report = normalize_report_record(report)
+    report_images = _coerce_dict(report.get('report_images'))
+    public_analysis = build_public_analysis_payload(report)
+    public_report_images = {
+        'input_image': _first_non_empty(report_images.get('input_image'), report.get('input_image')),
+        'enhanced_image': _first_non_empty(report_images.get('enhanced_image'), report.get('enhanced_image')),
+        'mask_image': _first_non_empty(report_images.get('mask_image'), report.get('mask_image')),
+        'boundary_image': _first_non_empty(report_images.get('boundary_image'), report.get('boundary_image')),
+    }
+
+    return {
+        'id': report.get('id'),
+        'patient_id': report.get('patient_id'),
+        'patient_name': report.get('patient_name'),
+        'patient_age': report.get('patient_age'),
+        'patient_gender': report.get('patient_gender'),
+        'type': report.get('type'),
+        'result': report.get('result'),
+        'symptoms': report.get('symptoms'),
+        'notes': report.get('notes'),
+        'detailed_info': _coerce_dict(report.get('detailed_info')),
+        'date': report.get('date'),
+        'status': report.get('status'),
+        'doctor_notes': report.get('doctor_notes'),
+        'prescription': report.get('prescription'),
+        'follow_up': report.get('follow_up'),
+        'reviewed_by': report.get('reviewed_by'),
+        'reviewed_date': report.get('reviewed_date'),
+        'approved_by': report.get('approved_by'),
+        'approved_date': report.get('approved_date'),
+        'rejected_by': report.get('rejected_by'),
+        'rejected_date': report.get('rejected_date'),
+        'sent_date': report.get('sent_date'),
+        'ai_confidence': report.get('ai_confidence'),
+        'tumor_confidence': report.get('tumor_confidence'),
+        'tumor_type': report.get('tumor_type'),
+        'tumor_stage': report.get('tumor_stage'),
+        'tumor_detected': report.get('tumor_detected'),
+        'alzheimer_confidence': report.get('alzheimer_confidence'),
+        'alzheimer_stage': report.get('alzheimer_stage'),
+        'alzheimer_detected': report.get('alzheimer_detected'),
+        'model_accuracy': report.get('model_accuracy'),
+        'ai_clinical_insights': _coerce_dict(public_analysis.get('ai_clinical_insights')),
+        'analysis': public_analysis,
+        'ai_results': report.get('ai_results'),
+        'report_images': public_report_images,
+        'input_image': public_report_images.get('input_image'),
+        'enhanced_image': public_report_images.get('enhanced_image'),
+        'mask_image': public_report_images.get('mask_image'),
+        'boundary_image': public_report_images.get('boundary_image'),
+        'download_enabled': bool(report.get('download_enabled')),
+        'report_ready': bool(report.get('report_ready')),
+        'report_created_at': report.get('report_created_at'),
+        'report_download_url': resolve_report_download_url(report.get('id')) if report.get('report_ready') else None,
+        'report_preview_url': f"/report-preview/{int(report.get('id'))}" if report.get('id') not in (None, '') else None,
+    }
+
+
+def build_prediction_response_payload(analysis, detection_type, input_image=None):
+    analysis = normalize_analysis_payload(analysis)
+    analysis_images = _coerce_dict(analysis.get('images'))
+    filtered_prediction = build_filtered_ai_result_payload(analysis, detection_type)
+    confidence = _first_non_empty(
+        _coerce_dict(filtered_prediction).get('confidence'),
+        _coerce_dict(_coerce_dict(filtered_prediction).get('brain_tumor')).get('confidence'),
+        _coerce_dict(_coerce_dict(filtered_prediction).get('alzheimer')).get('confidence'),
+        analysis.get('confidence'),
+    )
+    images = {
+        'input_image': _first_non_empty(
+            input_image,
+            _extract_image_payload(analysis_images.get('input')),
+            _extract_image_payload(analysis_images.get('original')),
+            analysis.get('input_image_base64'),
+            analysis.get('original_image_base64'),
+        ),
+        'enhanced_image': _first_non_empty(
+            _extract_image_payload(analysis_images.get('enhanced')),
+            analysis.get('enhanced_image_base64'),
+        ),
+        'mask_image': _first_non_empty(
+            _extract_image_payload(analysis_images.get('mask')),
+            analysis.get('mask_image_base64'),
+        ),
+        'boundary_image': _first_non_empty(
+            _extract_image_payload(analysis_images.get('boundary')),
+            _extract_image_payload(analysis_images.get('overlay')),
+            analysis.get('boundary_image_base64'),
+            analysis.get('segmentation_image'),
+        ),
+    }
+
+    return {
+        'prediction': filtered_prediction,
+        'confidence': confidence,
+        'images': images,
+        'input_image': images.get('input_image'),
+        'enhanced_image': images.get('enhanced_image'),
+        'mask_image': images.get('mask_image'),
+        'boundary_image': images.get('boundary_image'),
+        'ai_result': filtered_prediction,
+    }
+
+
+def _log_single_ai_result(result_payload):
+    result_payload = _coerce_dict(result_payload)
+    result_type = result_payload.get('type')
+    if result_type == 'Brain Tumor':
+        LOGGER.info('Prediction: Brain Tumor')
+        LOGGER.info('Confidence: %s', result_payload.get('confidence') or 'N/A')
+        LOGGER.info('Tumor Type: %s', result_payload.get('tumor_type') or 'N/A')
+        LOGGER.info('Tumor Stage/Grade: %s', result_payload.get('tumor_stage') or 'N/A')
+        LOGGER.info('Model Accuracy: %s', result_payload.get('model_accuracy') or 'Unavailable')
+        return
+    if result_type == 'Alzheimer':
+        LOGGER.info('Prediction: Alzheimer')
+        LOGGER.info('Confidence: %s', result_payload.get('confidence') or 'N/A')
+        LOGGER.info('Stage: %s', result_payload.get('stage') or 'N/A')
+        LOGGER.info('Model Accuracy: %s', result_payload.get('model_accuracy') or 'Unavailable')
+
+
+def log_prediction_summary(analysis, detection_type):
+    LOGGER.info('Model Loaded')
+    filtered_result = build_filtered_ai_result_payload(analysis, detection_type)
+    if isinstance(filtered_result, dict) and filtered_result.get('type'):
+        _log_single_ai_result(filtered_result)
+        return
+    for key in ('brain_tumor', 'alzheimer'):
+        _log_single_ai_result(_coerce_dict(_coerce_dict(filtered_result).get(key)))
+
+
+def load_reports_db():
+    if os.path.exists(REPORTS_DB_FILE):
+        with open(REPORTS_DB_FILE, 'r', encoding='utf-8') as file_handle:
+            return _coerce_dict_list(json.load(file_handle))
+    return []
+
+
+def save_reports_db(report_entries):
+    with open(REPORTS_DB_FILE, 'w', encoding='utf-8') as file_handle:
+        json.dump(_coerce_dict_list(report_entries), file_handle, indent=2)
+
+
+def get_report_registry_entry(report_id):
+    if report_id in (None, ''):
+        return {}
+    for entry in load_reports_db():
+        try:
+            if int(entry.get('report_id', -1)) == int(report_id):
+                return entry
+        except (TypeError, ValueError):
+            continue
+    return {}
+
+
+def upsert_report_registry_entry(metadata):
+    metadata = _coerce_dict(metadata)
+    if not metadata:
+        return {}
+
+    existing_entries = load_reports_db()
+    updated_entries = []
+    replaced = False
+    for entry in existing_entries:
+        try:
+            same_report = int(entry.get('report_id', -1)) == int(metadata.get('report_id', -2))
+        except (TypeError, ValueError):
+            same_report = False
+        if same_report:
+            updated_entries.append({**entry, **metadata})
+            replaced = True
+        else:
+            updated_entries.append(entry)
+    if not replaced:
+        updated_entries.append(metadata)
+    save_reports_db(updated_entries)
+    return metadata
+
+
+def delete_report_registry_entry(report_id):
+    filtered_entries = []
+    for entry in load_reports_db():
+        try:
+            same_report = int(entry.get('report_id', -1)) == int(report_id)
+        except (TypeError, ValueError):
+            same_report = False
+        if not same_report:
+            filtered_entries.append(entry)
+    save_reports_db(filtered_entries)
+
+
+def resolve_saved_report_path(report_id):
+    return os.path.join(REPORTS_OUTPUT_DIR, f'{int(report_id)}.pdf')
+
+
+def resolve_report_download_url(report_id):
+    return f'/generate-report/{int(report_id)}'
+
+
+def persist_report_pdf(report):
+    normalized_report = normalize_report_record(report)
+    report_id = int(normalized_report.get('id'))
+    output_path = resolve_saved_report_path(report_id)
+    report_buffer = build_medical_report_pdf(normalized_report)
+    with open(output_path, 'wb') as file_handle:
+        file_handle.write(report_buffer.getvalue())
+
+    created_at = datetime.now().isoformat()
+    metadata = {
+        'report_id': report_id,
+        'patient_id': normalized_report.get('patient_id'),
+        'report_ready': True,
+        'created_at': created_at,
+        'pdf_path': output_path,
+    }
+    upsert_report_registry_entry(metadata)
+    normalized_report['report_ready'] = True
+    normalized_report['download_enabled'] = True
+    normalized_report['report_file'] = output_path
+    normalized_report['report_created_at'] = created_at
+    LOGGER.info('Report Generated: %s', os.path.basename(output_path))
+    return normalized_report, metadata
+
+
+def get_accessible_saved_report(report_id, patient_id=None):
+    metadata = get_report_registry_entry(report_id)
+    if not metadata:
+        return {}, None
+
+    resolved_path = metadata.get('pdf_path') or resolve_saved_report_path(report_id)
+    if patient_id is not None:
+        try:
+            if int(metadata.get('patient_id', -1)) != int(patient_id):
+                return {}, None
+        except (TypeError, ValueError):
+            return {}, None
+    if not os.path.exists(resolved_path):
+        return metadata, None
+    return metadata, resolved_path
+
+
 def build_report_image_bundle(report):
     analysis = _coerce_dict(report.get('analysis'))
     analysis = normalize_analysis_payload(analysis) if analysis else {}
@@ -278,16 +653,17 @@ def build_report_image_bundle(report):
             existing_images.get('input_image'),
             report.get('input_image'),
             report.get('image'),
-        ),
-        'original_mri': _first_non_empty(
-            existing_images.get('original_mri'),
             report.get('original_mri'),
             report.get('original_image'),
+            _extract_image_payload(analysis_images.get('input')),
             _extract_image_payload(analysis_images.get('original')),
+            analysis.get('input_image_base64'),
             analysis.get('original_image_base64'),
+            enhancement.get('input_image_base64'),
             enhancement.get('original_image_base64'),
         ),
-        'enhanced_mri': _first_non_empty(
+        'enhanced_image': _first_non_empty(
+            existing_images.get('enhanced_image'),
             existing_images.get('enhanced_mri'),
             report.get('enhanced_mri'),
             report.get('enhanced_image'),
@@ -295,20 +671,28 @@ def build_report_image_bundle(report):
             analysis.get('enhanced_image_base64'),
             enhancement.get('enhanced_image_base64'),
         ),
-        'segmentation_overlay': _first_non_empty(
-            existing_images.get('segmentation_overlay'),
-            report.get('segmentation_overlay'),
-            report.get('segmentation_image'),
-            report.get('segmented_image'),
-            _extract_image_payload(analysis_images.get('overlay')),
-            _extract_image_payload(segmentation.get('overlay_image')),
-            analysis.get('segmentation_image'),
-        ),
-        'segmentation_mask': _first_non_empty(
-            existing_images.get('segmentation_mask'),
+        'mask_image': _first_non_empty(
+            existing_images.get('mask_image'),
+            report.get('mask_image'),
             report.get('segmentation_mask'),
             _extract_image_payload(analysis_images.get('mask')),
             _extract_image_payload(segmentation.get('mask_image')),
+            _extract_image_payload(segmentation.get('segmentation_mask')),
+            analysis.get('mask_image_base64'),
+        ),
+        'boundary_image': _first_non_empty(
+            existing_images.get('boundary_image'),
+            existing_images.get('segmentation_overlay'),
+            report.get('boundary_image'),
+            report.get('segmentation_overlay'),
+            report.get('segmentation_image'),
+            report.get('segmented_image'),
+            _extract_image_payload(analysis_images.get('boundary')),
+            _extract_image_payload(analysis_images.get('overlay')),
+            _extract_image_payload(segmentation.get('boundary_image')),
+            _extract_image_payload(segmentation.get('overlay_image')),
+            analysis.get('boundary_image_base64'),
+            analysis.get('segmentation_image'),
         ),
     }
     return normalized_images
@@ -321,17 +705,28 @@ def normalize_report_record(report):
     report['analysis'] = normalize_analysis_payload(report.get('analysis'))
     report_images = build_report_image_bundle(report)
     report['report_images'] = report_images
+    report_metadata = get_report_registry_entry(report.get('id'))
 
     report['image'] = _first_non_empty(report.get('image'), report_images.get('input_image'))
     report['input_image'] = _first_non_empty(report.get('input_image'), report_images.get('input_image'), report.get('image'))
-    report['original_mri'] = _first_non_empty(report.get('original_mri'), report_images.get('original_mri'))
-    report['enhanced_mri'] = _first_non_empty(report.get('enhanced_mri'), report_images.get('enhanced_mri'))
-    report['segmentation_overlay'] = _first_non_empty(report.get('segmentation_overlay'), report_images.get('segmentation_overlay'))
-    report['segmentation_mask'] = _first_non_empty(report.get('segmentation_mask'), report_images.get('segmentation_mask'))
-    report['original_image'] = _first_non_empty(report.get('original_image'), report['original_mri'])
-    report['enhanced_image'] = _first_non_empty(report.get('enhanced_image'), report['enhanced_mri'])
-    report['segmentation_image'] = _first_non_empty(report.get('segmentation_image'), report['segmentation_overlay'])
-    report['segmented_image'] = _first_non_empty(report.get('segmented_image'), report['segmentation_overlay'])
+    report['original_mri'] = _first_non_empty(report.get('original_mri'), report_images.get('input_image'))
+    report['original_image'] = _first_non_empty(report.get('original_image'), report['original_mri'], report['input_image'])
+    report['enhanced_image'] = _first_non_empty(report.get('enhanced_image'), report_images.get('enhanced_image'))
+    report['enhanced_mri'] = _first_non_empty(report.get('enhanced_mri'), report['enhanced_image'])
+    report['mask_image'] = _first_non_empty(report.get('mask_image'), report_images.get('mask_image'))
+    report['segmentation_mask'] = _first_non_empty(report.get('segmentation_mask'), report['mask_image'])
+    report['boundary_image'] = _first_non_empty(report.get('boundary_image'), report_images.get('boundary_image'))
+    report['segmentation_overlay'] = _first_non_empty(report.get('segmentation_overlay'), report['boundary_image'])
+    report['segmentation_image'] = _first_non_empty(report.get('segmentation_image'), report['boundary_image'])
+    report['segmented_image'] = _first_non_empty(report.get('segmented_image'), report['boundary_image'])
+    report['report_ready'] = bool(
+        report_metadata.get('report_ready')
+        or report.get('report_ready')
+        or report.get('download_enabled')
+    )
+    report['download_enabled'] = bool(report['report_ready'])
+    report['report_file'] = _first_non_empty(report.get('report_file'), report_metadata.get('pdf_path'))
+    report['report_created_at'] = _first_non_empty(report.get('report_created_at'), report_metadata.get('created_at'))
     report['tumor_type'] = _first_non_empty(
         report.get('tumor_type'),
         (report['analysis'].get('tumor') or {}).get('tumor_type'),
@@ -384,10 +779,14 @@ def normalize_report_record(report):
     if isinstance(report['model_metrics'], dict):
         report['model_metrics']['tumor'] = normalize_metric_payload(_coerce_dict(report['model_metrics'].get('tumor')))
         report['model_metrics']['alzheimers'] = normalize_metric_payload(_coerce_dict(report['model_metrics'].get('alzheimers')))
+    tumor_accuracy = normalize_metric_payload(_coerce_dict(report['model_metrics'].get('tumor'))).get('accuracy_label') if isinstance(report['model_metrics'], dict) else None
+    alzheimer_accuracy = normalize_metric_payload(_coerce_dict(report['model_metrics'].get('alzheimers'))).get('accuracy_label') if isinstance(report['model_metrics'], dict) else None
     report['model_accuracy'] = _first_non_empty(
         format_confidence_percentage(report.get('model_accuracy')),
-        normalize_metric_payload(_coerce_dict(report['model_metrics'].get('tumor'))).get('accuracy_label') if isinstance(report['model_metrics'], dict) else None,
+        tumor_accuracy,
+        alzheimer_accuracy,
         normalize_metric_payload(_coerce_dict((report['analysis'].get('tumor') or {}).get('model_metrics'))).get('accuracy_label'),
+        normalize_metric_payload(_coerce_dict((report['analysis'].get('alzheimers') or {}).get('model_metrics'))).get('accuracy_label'),
     )
     report['ai_clinical_insights'] = _coerce_dict(report.get('ai_clinical_insights')) or _coerce_dict(report['analysis'].get('ai_clinical_insights'))
     if isinstance(report['ai_clinical_insights'], dict):
@@ -398,6 +797,11 @@ def normalize_report_record(report):
         report['ai_clinical_insights']['model_accuracy'] = _first_non_empty(
             report['ai_clinical_insights'].get('model_accuracy'),
             report['model_accuracy'],
+        )
+        report['ai_clinical_insights']['boundary_status'] = _first_non_empty(
+            report['ai_clinical_insights'].get('boundary_status'),
+            report['ai_clinical_insights'].get('segmentation_boundary'),
+            'Detected' if _coerce_dict(report['analysis'].get('segmentation')).get('contour_count') else 'Unavailable',
         )
 
     model_confidences = _coerce_dict(report.get('model_confidences'))
@@ -426,6 +830,28 @@ def normalize_report_record(report):
     report['analysis']['confidence'] = ai_confidence
     report['analysis']['model_accuracy'] = report['model_accuracy']
     report['analysis']['alzheimer_stage'] = report['alzheimer_stage']
+    analysis_images = _coerce_dict(report['analysis'].get('images'))
+    report['analysis']['images'] = analysis_images
+    analysis_segmentation = _coerce_dict(report['analysis'].get('segmentation'))
+    if report.get('mask_image') is not None:
+        analysis_segmentation['mask_image'] = report.get('mask_image')
+    if report.get('boundary_image') is not None:
+        analysis_segmentation['boundary_image'] = report.get('boundary_image')
+    report['analysis']['segmentation'] = analysis_segmentation
+
+    asset_paths = _coerce_dict(report.get('asset_paths'))
+    if report.get('mask_image') and not asset_paths.get('mask_image'):
+        asset_paths['mask_image'] = report.get('mask_image_path')
+    if report.get('boundary_image') and not asset_paths.get('boundary_image'):
+        asset_paths['boundary_image'] = report.get('overlay_image_path') or report.get('boundary_image_path')
+    report['asset_paths'] = asset_paths
+    report['report_images'] = {
+        'input_image': report.get('input_image'),
+        'enhanced_image': report.get('enhanced_image'),
+        'mask_image': report.get('mask_image'),
+        'boundary_image': report.get('boundary_image'),
+    }
+    report['ai_results'] = build_filtered_ai_result_payload(report['analysis'], report.get('type'))
 
     return report
 
@@ -449,8 +875,16 @@ def save_users(users):
     sync_users_to_db(app.config['PLATFORM_DB_PATH'], users)
 
 def load_reports():
-    if os.path.exists(REPORTS_FILE):
-        with open(REPORTS_FILE, 'r') as f:
+    reports_file_path = REPORTS_FILE
+    if os.path.exists(reports_file_path):
+        file_size = os.path.getsize(reports_file_path)
+        # Skip loading if file is larger than 100MB to prevent memory issues
+        if file_size > 100 * 1024 * 1024:  # 100MB
+            print(f"[WARNING] Reports file is too large ({file_size / (1024*1024):.1f}MB), skipping bootstrap. Reports will be loaded on-demand.")
+            sync_reports_to_db(app.config['PLATFORM_DB_PATH'], [])
+            return []
+        
+        with open(reports_file_path, 'r') as f:
             reports = [normalize_report_record(report) for report in _coerce_dict_list(json.load(f))]
             sync_reports_to_db(app.config['PLATFORM_DB_PATH'], reports)
             return reports
@@ -472,6 +906,124 @@ def save_patient_details(details):
     with open(PATIENT_DETAILS_FILE, 'w') as f:
         json.dump(details, f, indent=2)
 
+
+def build_ai_assist_payload(report):
+    report = normalize_report_record(report)
+    analysis_payload = _coerce_dict(report.get('analysis'))
+    tumor_payload = _coerce_dict(analysis_payload.get('tumor'))
+    alzheimer_payload = _coerce_dict(analysis_payload.get('alzheimers'))
+    segmentation_payload = _coerce_dict(analysis_payload.get('segmentation'))
+    normalized_type = normalize_detection_type(report.get('type'))
+    tumor_detected = bool(tumor_payload.get('detected', report.get('tumor_detected')))
+    alzheimer_detected = bool(alzheimer_payload.get('detected', report.get('alzheimer_detected')))
+    tumor_type = report.get('tumor_type') or tumor_payload.get('tumor_type') or tumor_payload.get('classification') or 'brain lesion'
+    tumor_stage = report.get('tumor_stage') or tumor_payload.get('tumor_stage') or tumor_payload.get('grade') or 'N/A'
+    tumor_confidence = report.get('tumor_confidence') or tumor_payload.get('confidence') or 'N/A'
+    alzheimer_stage = report.get('alzheimer_stage') or alzheimer_payload.get('stage') or 'NonDemented'
+    alzheimer_confidence = report.get('alzheimer_confidence') or alzheimer_payload.get('confidence') or 'N/A'
+    contour_count = int(segmentation_payload.get('contour_count') or 0)
+    boundary_phrase = (
+        f'{contour_count} red boundary contour{"s" if contour_count != 1 else ""} outlined on the original MRI'
+        if contour_count
+        else 'no reliable focal red boundary outlined on the MRI'
+    )
+
+    if normalized_type == 'brain':
+        if tumor_detected:
+            return {
+                'doctor_notes': (
+                    f'MRI analysis suggests presence of {tumor_type} with confidence {tumor_confidence} '
+                    f'and estimated stage {tumor_stage}. The image processing pipeline identified {boundary_phrase}. '
+                    'Clinical correlation with symptoms and specialist review is recommended.'
+                ),
+                'prescription': (
+                    'Recommend corticosteroids to reduce edema if clinically indicated, together with symptom-guided '
+                    'supportive care and further contrast-enhanced neuroimaging review.'
+                ),
+                'follow_up': (
+                    'Follow-up MRI in 4-6 weeks. Neurosurgery or neurology consultation is advised, '
+                    'with earlier review if symptoms worsen.'
+                ),
+            }
+        return {
+            'doctor_notes': (
+                f'MRI analysis does not show a convincing focal tumor pattern. Current classifier confidence is '
+                f'{tumor_confidence}, and the contour pipeline found {boundary_phrase}. Continued clinical monitoring is recommended.'
+            ),
+            'prescription': (
+                'Provide symptomatic care as needed and continue routine neurological observation according to the clinical presentation.'
+            ),
+            'follow_up': (
+                'Repeat imaging if symptoms persist or worsen. Clinical follow-up with the treating physician is advised.'
+            ),
+        }
+
+    if normalized_type == 'alz':
+        return {
+            'doctor_notes': (
+                f'MRI analysis suggests Alzheimer stage {alzheimer_stage} with confidence {alzheimer_confidence}. '
+                'Clinical cognitive assessment and neurological correlation are recommended.'
+            ),
+            'prescription': (
+                'Recommend cognitive evaluation, medication review, and supportive neurocognitive management per specialist guidance.'
+            ),
+            'follow_up': (
+                'Neurology consultation is advised with repeat cognitive and imaging review in 4-6 weeks or as clinically indicated.'
+            ),
+        }
+
+    note_parts = []
+    if tumor_detected:
+        note_parts.append(
+            f'Brain MRI suggests {tumor_type} with confidence {tumor_confidence} and estimated stage {tumor_stage}; {boundary_phrase}.'
+        )
+    if alzheimer_detected:
+        note_parts.append(
+            f'Concurrent Alzheimer pattern is estimated at stage {alzheimer_stage} with confidence {alzheimer_confidence}.'
+        )
+    if not note_parts:
+        note_parts.append(
+            'Combined AI analysis does not show a convincing focal tumor pattern or clear Alzheimer-stage abnormality on the current scan.'
+        )
+    return {
+        'doctor_notes': ' '.join(note_parts) + ' Clinical correlation and multidisciplinary review are recommended.',
+        'prescription': (
+            'Recommend symptom-guided supportive care, targeted neurological evaluation, and additional imaging or cognitive testing as clinically indicated.'
+        ),
+        'follow_up': (
+            'Arrange specialist follow-up within 4-6 weeks, with earlier reassessment if neurological or cognitive symptoms progress.'
+        ),
+    }
+
+
+def finalize_report_submission(report, submission_data, status, submitted_by, timestamp_field):
+    report['doctor_notes'] = submission_data.get('doctor_notes', '')
+    report['prescription'] = submission_data.get('prescription', '')
+    report['follow_up'] = submission_data.get('follow_up', '')
+    report['status'] = status
+    report['report_ready'] = True
+    report['download_enabled'] = True
+    report['submitted_by'] = submitted_by
+    report['submitted_date'] = datetime.now().isoformat()
+    report[timestamp_field] = report['submitted_date']
+
+    normalized_report, metadata = persist_report_pdf(report)
+    report.update(normalized_report)
+    return metadata
+
+
+def get_latest_ready_report_entry(patient_id):
+    ready_reports = []
+    for entry in load_reports_db():
+        try:
+            same_patient = int(entry.get('patient_id', -1)) == int(patient_id)
+        except (TypeError, ValueError):
+            same_patient = False
+        if same_patient and entry.get('report_ready'):
+            ready_reports.append(entry)
+    ready_reports.sort(key=lambda item: item.get('created_at', ''), reverse=True)
+    return ready_reports[0] if ready_reports else {}
+
 # Authentication decorator
 def login_required(user_type=None):
     def decorator(f):
@@ -490,7 +1042,9 @@ def load_brain_model():
     if brain_model is None:
         brain_model = get_model_registry().get_tumor_model().model
         if brain_model is None:
-            print("Brain model not found. Using fallback mode.")
+            LOGGER.warning("Brain model not found. Using fallback mode.")
+        else:
+            LOGGER.info("Model Loaded: Brain classifier")
     return brain_model
 
 def load_alz_model():
@@ -498,7 +1052,9 @@ def load_alz_model():
     if alz_model is None:
         alz_model = get_model_registry().get_alzheimer_model().model
         if alz_model is None:
-            print("Alzheimer model not found. Using fallback mode.")
+            LOGGER.warning("Alzheimer model not found. Using fallback mode.")
+        else:
+            LOGGER.info("Model Loaded: Alzheimer classifier")
     return alz_model
 
 def get_detailed_data(cls):
@@ -673,6 +1229,155 @@ def doctor_portal():
 @app.route('/uploads/<path:filename>')
 def uploaded_file(filename):
     return send_from_directory(app.config['UPLOAD_FOLDER'], filename)
+
+
+@app.route('/predict', methods=['POST'])
+def predict():
+    if 'file' not in request.files:
+        return jsonify({'error': 'No file uploaded'}), 400
+
+    uploaded_file = request.files['file']
+    if uploaded_file.filename == '':
+        return jsonify({'error': 'No file selected'}), 400
+    if not allowed_file(uploaded_file.filename):
+        return jsonify({'error': 'Invalid file type'}), 400
+
+    image_bytes = uploaded_file.read()
+    if not image_bytes:
+        return jsonify({'error': 'Uploaded image is empty'}), 400
+
+    detection_type = normalize_detection_type(
+        request.form.get('type') or request.form.get('detection_type') or 'brain'
+    )
+
+    try:
+        analysis = analyze_medical_image(
+            image_bytes=image_bytes,
+            detection_type=detection_type,
+            voxel_metadata={
+                'pixel_spacing_x': request.form.get('pixel_spacing_x'),
+                'pixel_spacing_y': request.form.get('pixel_spacing_y'),
+                'slice_thickness': request.form.get('slice_thickness'),
+            },
+        )
+    except Exception as exc:
+        return jsonify({'error': str(exc)}), 500
+
+    log_prediction_summary(analysis, detection_type)
+    input_image = base64.b64encode(image_bytes).decode('utf-8')
+    return jsonify({
+        'success': True,
+        **build_prediction_response_payload(analysis, detection_type, input_image=input_image),
+    })
+
+
+@app.route('/doctor-submit', methods=['POST'])
+@login_required('doctor')
+def doctor_submit():
+    try:
+        data = _get_request_json_dict()
+    except ValueError as exc:
+        return jsonify({'error': str(exc)}), 400
+
+    report_id = data.get('report_id')
+    if report_id in (None, ''):
+        return jsonify({'error': 'report_id is required'}), 400
+
+    reports = load_reports()
+    report = next((item for item in reports if int(item.get('id', -1)) == int(report_id)), None)
+    if not report:
+        return jsonify({'error': 'Report not found'}), 404
+
+    report['approved_by'] = session['full_name']
+    metadata = finalize_report_submission(
+        report,
+        data,
+        status='approved',
+        submitted_by=session['full_name'],
+        timestamp_field='approved_date',
+    )
+
+    save_reports(reports)
+    try:
+        emit_report_status_updated(socketio, report, doctor_id=session.get('user_id'))
+    except Exception:
+        pass
+
+    return jsonify({
+        'success': True,
+        'download_enabled': True,
+        'report_ready': True,
+        'report_download_url': resolve_report_download_url(report['id']),
+        'report_metadata': metadata,
+        'report': build_public_report_payload(report),
+    })
+
+
+@app.route('/generate-report')
+@app.route('/generate-report/<int:report_id>')
+def generate_report(report_id=None):
+    if 'user_id' not in session:
+        return jsonify({'error': 'Please login first'}), 401
+
+    report_id = report_id if report_id is not None else request.args.get('report_id', type=int)
+    if report_id is None:
+        return jsonify({'error': 'report_id is required'}), 400
+
+    reports = load_reports()
+    if session.get('user_type') == 'patient':
+        report = next((item for item in reports if item['id'] == report_id and item['patient_id'] == session['user_id']), None)
+    else:
+        report = next((item for item in reports if item['id'] == report_id), None)
+
+    if not report:
+        return jsonify({'error': 'Report not found'}), 404
+    if not report.get('report_ready'):
+        return jsonify({'error': 'Report download is available after doctor submission'}), 403
+
+    normalized_report, metadata = persist_report_pdf(report)
+    report.update(normalized_report)
+    save_reports(reports)
+    saved_report_path = metadata.get('pdf_path')
+
+    return send_file(saved_report_path, as_attachment=True, download_name=os.path.basename(saved_report_path), mimetype='application/pdf')
+
+
+@app.route('/report-preview/<int:report_id>')
+@login_required()
+def preview_report(report_id):
+    reports = load_reports()
+    if session.get('user_type') == 'patient':
+        report = next((item for item in reports if item['id'] == report_id and item['patient_id'] == session['user_id']), None)
+    else:
+        report = next((item for item in reports if item['id'] == report_id), None)
+
+    if not report:
+        return jsonify({'error': 'Report not found'}), 404
+
+    normalized_report = normalize_report_record(report)
+    return render_template(
+        'report_clinical.html',
+        report=normalized_report,
+        report_context=build_report_context(normalized_report),
+    )
+
+
+@app.route('/patient-report/<int:patient_id>')
+@login_required()
+def get_patient_ready_report(patient_id):
+    if session.get('user_type') == 'patient' and int(session.get('user_id', -1)) != int(patient_id):
+        return jsonify({'error': 'Unauthorized access'}), 403
+
+    report_entry = get_latest_ready_report_entry(patient_id)
+    if not report_entry:
+        return jsonify({'patient_id': patient_id, 'report_ready': False, 'report_id': None})
+
+    return jsonify({
+        'patient_id': patient_id,
+        'report_ready': True,
+        'report_id': report_entry.get('report_id'),
+        'created_at': report_entry.get('created_at'),
+    })
 
 @app.route('/api/patient/register', methods=['POST'])
 def patient_register():
@@ -857,9 +1562,7 @@ def patient_upload():
         return jsonify({'error': 'No file uploaded'}), 400
     
     file = request.files['file']
-    detection_type = request.form.get('type', 'brain')
-    if detection_type not in ['brain', 'alz']:
-        detection_type = 'brain'
+    detection_type = normalize_detection_type(request.form.get('type', 'brain'))
     symptoms = request.form.get('symptoms', '')
     notes = request.form.get('notes', '')
     patient_name = request.form.get('patient_name', '')
@@ -888,6 +1591,7 @@ def patient_upload():
             analysis = safe_dict(analysis)
             if not analysis:
                 return jsonify({'error': 'Invalid analysis result'}), 500
+            log_prediction_summary(analysis, detection_type)
 
             tumor_result = safe_dict(analysis.get('tumor'))
             alzheimer_result = safe_dict(analysis.get('alzheimers'))
@@ -903,12 +1607,12 @@ def patient_upload():
 
             detailed_info = get_detailed_data(result)
             img_base64 = base64.b64encode(image_bytes).decode('utf-8')
+            prediction_payload = build_prediction_response_payload(analysis, detection_type, input_image=img_base64)
             report_images = {
                 'input_image': img_base64,
-                'original_mri': analysis.get('original_image_base64') or img_base64,
-                'enhanced_mri': analysis.get('enhanced_image_base64'),
-                'segmentation_overlay': analysis.get('segmentation_image'),
-                'segmentation_mask': analysis.get('segmentation_mask'),
+                'enhanced_image': prediction_payload.get('enhanced_image'),
+                'mask_image': prediction_payload.get('mask_image'),
+                'boundary_image': prediction_payload.get('boundary_image'),
             }
             
             reports = load_reports()
@@ -926,18 +1630,24 @@ def patient_upload():
                 'date': datetime.now().isoformat(),
                 'image': img_base64,
                 'input_image': img_base64,
-                'original_image': analysis.get('original_image_base64') or img_base64,
-                'original_mri': analysis.get('original_image_base64') or img_base64,
-                'original_image_path': analysis.get('original_image'),
+                'original_image': analysis.get('input_image_base64') or img_base64,
+                'original_mri': analysis.get('input_image_base64') or img_base64,
+                'original_image_path': analysis.get('input_image'),
                 'enhanced_image': analysis.get('enhanced_image_base64'),
                 'enhanced_mri': analysis.get('enhanced_image_base64'),
                 'enhanced_image_path': analysis.get('enhanced_image'),
+                'mask_image': prediction_payload.get('mask_image'),
+                'mask_image_path': analysis.get('mask_image'),
+                'segmentation_mask': prediction_payload.get('mask_image'),
                 'filename': filename,
                 'status': 'pending',
+                'report_ready': False,
+                'download_enabled': False,
                 'doctor_notes': '',
                 'prescription': '',
                 'follow_up': '',
                 'ai_result': result,
+                'ai_results': prediction_payload.get('ai_result'),
                 'ai_confidence': confidence,
                 'tumor_confidence': tumor_result.get('confidence'),
                 'tumor_type': tumor_result.get('tumor_type') or tumor_result.get('classification'),
@@ -949,23 +1659,25 @@ def patient_upload():
                 'tumor_volume_mm3': tumor_result.get('volume_mm3'),
                 'alzheimer_detected': alzheimer_result.get('detected', False),
                 'alzheimer_stage': alzheimer_result.get('stage'),
-                'model_accuracy': analysis.get('model_accuracy'),
+                'model_accuracy': _first_non_empty(
+                    _coerce_dict(prediction_payload.get('ai_result')).get('model_accuracy'),
+                    analysis.get('model_accuracy'),
+                ),
                 'model_metrics': analysis.get('model_metrics'),
                 'ai_clinical_insights': analysis.get('ai_clinical_insights'),
-                'segmentation_image': analysis.get('segmentation_image'),
-                'segmentation_overlay': analysis.get('segmentation_image'),
-                'segmented_image': analysis.get('segmentation_image'),
-                'segmentation_mask': analysis.get('segmentation_mask'),
-                'overlay_image_path': analysis.get('overlay_image'),
-                'mask_image_path': analysis.get('mask_image'),
+                'boundary_image': prediction_payload.get('boundary_image'),
+                'segmentation_image': prediction_payload.get('boundary_image'),
+                'segmentation_overlay': prediction_payload.get('boundary_image'),
+                'segmented_image': prediction_payload.get('boundary_image'),
+                'overlay_image_path': analysis.get('boundary_image'),
                 'study_id': analysis.get('study_id'),
                 'report_images': report_images,
                 'asset_paths': {
                     'input_image': None,
-                    'original_image': analysis.get('original_image'),
+                    'original_image': analysis.get('input_image') or analysis.get('original_image'),
                     'enhanced_image': analysis.get('enhanced_image'),
-                    'overlay_image': analysis.get('overlay_image'),
                     'mask_image': analysis.get('mask_image'),
+                    'boundary_image': analysis.get('boundary_image'),
                 },
                 'model_confidences': {
                     'tumor': tumor_result.get('confidence'),
@@ -1000,13 +1712,12 @@ def patient_upload():
                 'success': True,
                 'result': result,
                 'confidence': confidence,
-                'tumor_type': analysis.get('tumor_type'),
-                'tumor_stage': analysis.get('tumor_stage'),
-                'model_accuracy': analysis.get('model_accuracy'),
+                'model_accuracy': report.get('model_accuracy'),
                 'detailed_info': detailed_info,
                 'report_id': report['id'],
-                'analysis': analysis,
-                'segmentation_image': analysis.get('segmentation_image')
+                'report_ready': report.get('report_ready', False),
+                'download_enabled': report.get('download_enabled', False),
+                **prediction_payload,
             })
             
         except Exception as e:
@@ -1020,7 +1731,7 @@ def get_patient_reports():
     reports = load_reports()
     patient_reports = [r for r in reports if r['patient_id'] == session['user_id']]
     patient_reports.sort(key=lambda x: x['date'], reverse=True)
-    return jsonify({'reports': patient_reports})
+    return jsonify({'reports': [build_public_report_payload(report) for report in patient_reports]})
 
 @app.route('/api/patient/report/<int:report_id>')
 @login_required('patient')
@@ -1028,7 +1739,7 @@ def get_patient_report(report_id):
     reports = load_reports()
     report = next((r for r in reports if r['id'] == report_id and r['patient_id'] == session['user_id']), None)
     if report:
-        return jsonify({'report': report})
+        return jsonify({'report': build_public_report_payload(report)})
     return jsonify({'error': 'Report not found'}), 404
 
 @app.route('/api/patient/report/<int:report_id>/download')
@@ -1039,10 +1750,14 @@ def download_report_pdf(report_id):
     
     if not report:
         return jsonify({'error': 'Report not found'}), 404
+    if not report.get('report_ready'):
+        return jsonify({'error': 'Report download is available after doctor submission'}), 403
 
-    buffer = build_medical_report_pdf(report)
-    
-    return send_file(buffer, as_attachment=True, download_name="medical_report_" + str(report_id) + ".pdf", mimetype='application/pdf')
+    normalized_report, metadata = persist_report_pdf(report)
+    report.update(normalized_report)
+    save_reports(reports)
+    saved_report_path = metadata.get('pdf_path')
+    return send_file(saved_report_path, as_attachment=True, download_name=os.path.basename(saved_report_path), mimetype='application/pdf')
 
 @app.route('/api/doctor/patients')
 @login_required('doctor')
@@ -1102,7 +1817,7 @@ def get_patient_details(patient_id):
             'medical_history': patient.get('medical_history', ''),
             'created_at': patient.get('created_at', '')
         },
-        'reports': patient_reports,
+        'reports': [build_public_report_payload(report) for report in patient_reports],
         'additional_info': details
     })
 
@@ -1112,8 +1827,19 @@ def get_report(report_id):
     reports = load_reports()
     report = next((r for r in reports if r['id'] == report_id), None)
     if report:
-        return jsonify({'report': report})
+        return jsonify({'report': build_public_report_payload(report)})
     return jsonify({'error': 'Report not found'}), 404
+
+
+@app.route('/api/doctor/report/<int:report_id>/ai-assist')
+@login_required('doctor')
+def get_doctor_ai_assist(report_id):
+    reports = load_reports()
+    report = next((r for r in reports if r['id'] == report_id), None)
+    if not report:
+        return jsonify({'error': 'Report not found'}), 404
+    LOGGER.info('AI Assist prepared for report %s', report_id)
+    return jsonify({'success': True, 'ai_assist': build_ai_assist_payload(report)})
 
 @app.route('/api/doctor/report/<int:report_id>/update', methods=['POST'])
 @login_required('doctor')
@@ -1132,8 +1858,13 @@ def update_report(report_id):
     report['prescription'] = data.get('prescription', '')
     report['follow_up'] = data.get('follow_up', '')
     report['status'] = 'reviewed'
+    report['report_ready'] = False
+    report['download_enabled'] = False
+    report['report_file'] = None
+    report['report_created_at'] = None
     report['reviewed_by'] = session['full_name']
     report['reviewed_date'] = datetime.now().isoformat()
+    delete_report_registry_entry(report_id)
     
     save_reports(reports)
     try:
@@ -1141,7 +1872,13 @@ def update_report(report_id):
     except Exception:
         pass
     
-    return jsonify({'success': True, 'message': 'Report saved as draft'})
+    return jsonify({
+        'success': True,
+        'message': 'Report saved as draft',
+        'download_enabled': False,
+        'report_ready': False,
+        'report': build_public_report_payload(report),
+    })
 
 @app.route('/api/doctor/report/<int:report_id>/approve', methods=['POST'])
 @login_required('doctor')
@@ -1155,13 +1892,14 @@ def approve_report(report_id):
     report = next((r for r in reports if r['id'] == report_id), None)
     if not report:
         return jsonify({'error': 'Report not found'}), 404
-    
-    report['doctor_notes'] = data.get('doctor_notes', '')
-    report['prescription'] = data.get('prescription', '')
-    report['follow_up'] = data.get('follow_up', '')
-    report['status'] = 'approved'
     report['approved_by'] = session['full_name']
-    report['approved_date'] = datetime.now().isoformat()
+    metadata = finalize_report_submission(
+        report,
+        data,
+        status='approved',
+        submitted_by=session['full_name'],
+        timestamp_field='approved_date',
+    )
     
     save_reports(reports)
     try:
@@ -1169,7 +1907,15 @@ def approve_report(report_id):
     except Exception:
         pass
     
-    return jsonify({'success': True, 'message': 'Report approved'})
+    return jsonify({
+        'success': True,
+        'message': 'Report approved',
+        'download_enabled': True,
+        'report_ready': True,
+        'report_download_url': resolve_report_download_url(report_id),
+        'report_metadata': metadata,
+        'report': build_public_report_payload(report),
+    })
 
 @app.route('/api/doctor/report/<int:report_id>/reject', methods=['POST'])
 @login_required('doctor')
@@ -1186,8 +1932,13 @@ def reject_report(report_id):
     
     report['doctor_notes'] = data.get('doctor_notes', '')
     report['status'] = 'rejected'
+    report['report_ready'] = False
+    report['download_enabled'] = False
+    report['report_file'] = None
+    report['report_created_at'] = None
     report['rejected_by'] = session['full_name']
     report['rejected_date'] = datetime.now().isoformat()
+    delete_report_registry_entry(report_id)
     
     save_reports(reports)
     try:
@@ -1195,7 +1946,13 @@ def reject_report(report_id):
     except Exception:
         pass
     
-    return jsonify({'success': True, 'message': 'Report rejected'})
+    return jsonify({
+        'success': True,
+        'message': 'Report rejected',
+        'download_enabled': False,
+        'report_ready': False,
+        'report': build_public_report_payload(report),
+    })
 
 @app.route('/api/doctor/report/<int:report_id>/send', methods=['POST'])
 @login_required('doctor')
@@ -1209,13 +1966,14 @@ def send_report_to_patient(report_id):
     report = next((r for r in reports if r['id'] == report_id), None)
     if not report:
         return jsonify({'error': 'Report not found'}), 404
-    
-    report['doctor_notes'] = data.get('doctor_notes', '')
-    report['prescription'] = data.get('prescription', '')
-    report['follow_up'] = data.get('follow_up', '')
-    report['status'] = 'sent'
     report['reviewed_by'] = session['full_name']
-    report['sent_date'] = datetime.now().isoformat()
+    metadata = finalize_report_submission(
+        report,
+        data,
+        status='sent',
+        submitted_by=session['full_name'],
+        timestamp_field='sent_date',
+    )
     
     save_reports(reports)
     try:
@@ -1223,7 +1981,15 @@ def send_report_to_patient(report_id):
     except Exception:
         pass
     
-    return jsonify({'success': True, 'message': 'Report sent to patient'})
+    return jsonify({
+        'success': True,
+        'message': 'Report sent to patient',
+        'download_enabled': True,
+        'report_ready': True,
+        'report_download_url': resolve_report_download_url(report_id),
+        'report_metadata': metadata,
+        'report': build_public_report_payload(report),
+    })
 
 @app.route('/api/doctor/stats')
 @login_required('doctor')
@@ -1253,4 +2019,7 @@ def handle_error(e):
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', '5000'))
     debug_mode = os.environ.get('FLASK_DEBUG', '').lower() in {'1', 'true', 'yes'}
-    socketio.run(app, debug=debug_mode, use_reloader=False, host='0.0.0.0', port=port)
+    print(f"==================================================")
+    print(f"🚀 NeuroDetect Server is running at http://localhost:{port}")
+    print(f"==================================================")
+    socketio.run(app, debug=debug_mode, use_reloader=False, host='0.0.0.0', port=port, allow_unsafe_werkzeug=True)

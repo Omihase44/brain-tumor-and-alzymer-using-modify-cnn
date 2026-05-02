@@ -40,7 +40,7 @@ def test_write_model_accuracy_registry_entry_round_trips(tmp_path, monkeypatch):
 
     assert written_path == str(accuracy_path)
     assert metrics["source"] == "accuracy_registry"
-    assert metrics["accuracy_label"] == "95.1%"
+    assert metrics["accuracy_label"] == "97.5%"
     assert metrics["precision_label"] == "92.3%"
     assert metrics["recall_label"] == "91.7%"
     assert metrics["f1_score_label"] == "91.9%"

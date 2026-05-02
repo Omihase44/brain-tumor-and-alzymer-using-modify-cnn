@@ -9,10 +9,11 @@ from utils.image_processing import ensure_three_channel
 
 
 class SegmentationService:
-    """Segment lesion masks and generate clinically readable overlays."""
+    """Generate a stable single-region tumor mask and clean boundary overlay."""
 
     def __init__(self):
-        self.model = get_model_registry().get_segmentation_model()
+        self._model_registry = get_model_registry()
+        self.model = None
 
     def segment(
         self,
@@ -21,67 +22,280 @@ class SegmentationService:
         tumor_detected: bool = True,
         prepared_input: Optional[np.ndarray] = None,
     ) -> Dict[str, object]:
-        original_image = ensure_three_channel(original_image)
-        working_image = ensure_three_channel(working_image)
-        mask = self.model.predict_mask(
-            working_image,
+        original = ensure_three_channel(original_image)
+        working = ensure_three_channel(working_image)
+
+        if not tumor_detected:
+            empty_mask = np.zeros(original.shape[:2], dtype=np.uint8)
+            return {
+                "mask": empty_mask,
+                "overlay": original.copy(),
+                "bounding_box": None,
+                "backend": "empty_mask_no_tumor",
+                "contour_count": 0,
+            }
+
+        candidate_image = self._preprocess_candidate_image(working)
+        brain_mask = self._build_brain_mask(original)
+        segmentation_model = self._get_segmentation_model()
+
+        model_mask = segmentation_model.predict_mask(
+            working,
             tumor_detected=tumor_detected,
             model_input=prepared_input,
         )
-        display_mask = self._build_display_mask(mask)
-        overlay = self._draw_contours_and_box(original_image, display_mask)
-        bounding_box = self._extract_bounding_box(display_mask)
+        refined_mask = self._postprocess_mask(
+            model_mask,
+            candidate_image=candidate_image,
+            brain_mask=brain_mask,
+        )
+
+        backend = f"{getattr(segmentation_model, 'backend', 'model')}_postprocessed"
+        if np.count_nonzero(refined_mask) == 0:
+            heuristic_mask = self._build_high_intensity_mask(candidate_image, brain_mask)
+            refined_mask = self._postprocess_mask(
+                heuristic_mask,
+                candidate_image=candidate_image,
+                brain_mask=brain_mask,
+            )
+            backend = "opencv_percentile97_postprocessed"
+
+        contour = self._extract_contour(refined_mask)
+        overlay = self._draw_overlay(original, contour)
+        bounding_box = self._get_bbox(refined_mask)
 
         return {
-            "mask": mask,
-            "display_mask": display_mask,
+            "mask": refined_mask,
+            "display_mask": refined_mask.copy(),
             "overlay": overlay,
             "bounding_box": bounding_box,
-            "backend": self.model.backend,
-            "contour_count": self._contour_count(display_mask),
+            "backend": backend,
+            "contour_count": 1 if contour is not None else 0,
         }
 
-    def _build_display_mask(self, mask: np.ndarray) -> np.ndarray:
-        if np.count_nonzero(mask) == 0:
-            return mask.copy()
-        thresholded = cv2.threshold(mask.astype(np.uint8), 32, 255, cv2.THRESH_BINARY)[1]
-        kernel_small = np.ones((3, 3), np.uint8)
-        kernel_large = np.ones((5, 5), np.uint8)
-        cleaned = cv2.erode(thresholded, kernel_small, iterations=1)
-        cleaned = cv2.dilate(cleaned, kernel_small, iterations=2)
-        cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_OPEN, kernel_small, iterations=1)
-        cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_CLOSE, kernel_large, iterations=2)
+    def _get_segmentation_model(self):
+        injected_model = getattr(self, "model", None)
+        if injected_model is not None:
+            return injected_model
 
-        contours, _ = cv2.findContours(cleaned, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        model_registry = getattr(self, "_model_registry", None)
+        if model_registry is None:
+            model_registry = get_model_registry()
+            self._model_registry = model_registry
+        return model_registry.get_segmentation_model()
+
+    def _preprocess_candidate_image(self, image: np.ndarray) -> np.ndarray:
+        grayscale = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        blurred = cv2.GaussianBlur(grayscale, (5, 5), 0)
+        return cv2.normalize(blurred, None, 0, 255, cv2.NORM_MINMAX)
+
+    def _build_brain_mask(self, image: np.ndarray) -> np.ndarray:
+        grayscale = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        _, thresholded = cv2.threshold(grayscale, 10, 255, cv2.THRESH_BINARY)
+        contours, _ = cv2.findContours(thresholded, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         if not contours:
-            return cleaned
+            return np.ones_like(grayscale, dtype=np.uint8) * 255
 
-        filled_mask = np.zeros_like(cleaned, dtype=np.uint8)
-        cv2.drawContours(filled_mask, contours, -1, 255, thickness=cv2.FILLED)
-        return filled_mask
+        largest_contour = max(contours, key=cv2.contourArea)
+        brain_mask = np.zeros_like(grayscale, dtype=np.uint8)
+        cv2.drawContours(brain_mask, [largest_contour], -1, 255, thickness=cv2.FILLED)
+        brain_mask = cv2.morphologyEx(
+            brain_mask,
+            cv2.MORPH_CLOSE,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (13, 13)),
+            iterations=2,
+        )
+        brain_mask = cv2.erode(
+            brain_mask,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11)),
+            iterations=1,
+        )
+        return brain_mask
 
-    def _build_alpha_mask(self, mask: np.ndarray) -> np.ndarray:
-        blurred = cv2.GaussianBlur(mask, (11, 11), 0).astype(np.float32) / 255.0
-        return np.clip(blurred * 0.24, 0.0, 0.24)
+    def _build_high_intensity_mask(self, image: np.ndarray, brain_mask: np.ndarray) -> np.ndarray:
+        high_intensity_mask = np.zeros_like(image, dtype=np.uint8)
+        inside_brain = image[brain_mask > 0]
+        if inside_brain.size == 0:
+            return high_intensity_mask
 
-    def _draw_contours_and_box(self, image: np.ndarray, display_mask: np.ndarray) -> np.ndarray:
-        if np.count_nonzero(display_mask) == 0:
-            return image.copy()
+        threshold_value = float(np.percentile(inside_brain, 97.0))
+        high_intensity_mask[(image >= threshold_value) & (brain_mask > 0)] = 255
+        return high_intensity_mask
 
-        overlay = image.astype(np.float32).copy()
-        alpha_mask = self._build_alpha_mask(display_mask)
-        color_mask = np.zeros_like(overlay)
-        color_mask[:, :, 1] = 255.0
-        overlay = (overlay * (1.0 - alpha_mask[..., None])) + (color_mask * alpha_mask[..., None])
-        overlay = np.clip(overlay, 0, 255).astype(np.uint8)
+    def _postprocess_mask(
+        self,
+        predicted_mask: np.ndarray,
+        candidate_image: np.ndarray,
+        brain_mask: np.ndarray,
+    ) -> np.ndarray:
+        binary_mask = self._to_binary_mask(predicted_mask)
+        binary_mask = cv2.bitwise_and(binary_mask, brain_mask)
 
-        contours, _ = cv2.findContours(display_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        cv2.drawContours(overlay, contours, -1, (0, 255, 0), 2, lineType=cv2.LINE_AA)
+        close_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+        open_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        binary_mask = cv2.morphologyEx(binary_mask, cv2.MORPH_CLOSE, close_kernel, iterations=2)
+        binary_mask = cv2.morphologyEx(binary_mask, cv2.MORPH_OPEN, open_kernel, iterations=1)
+
+        best_region = self._select_best_region(binary_mask, candidate_image)
+        if np.count_nonzero(best_region) == 0:
+            return best_region
+
+        smoothed_mask = self._smooth_mask(best_region)
+        smoothed_mask = cv2.bitwise_and(smoothed_mask, brain_mask)
+        return self._largest_component(smoothed_mask)
+
+    def _to_binary_mask(self, mask: np.ndarray) -> np.ndarray:
+        if mask.dtype.kind in {"f"}:
+            return np.where(mask >= 0.5, 255, 0).astype(np.uint8)
+        return np.where(mask >= 127, 255, 0).astype(np.uint8)
+
+    def _select_best_region(self, mask: np.ndarray, candidate_image: np.ndarray) -> np.ndarray:
+        if np.count_nonzero(mask) == 0:
+            return np.zeros_like(mask, dtype=np.uint8)
+
+        component_count, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+        if component_count <= 1:
+            return self._validate_single_region(mask)
+
+        height, width = mask.shape
+        image_area = float(height * width)
+        best_label = 0
+        best_score = -np.inf
+
+        for label_index in range(1, component_count):
+            area = int(stats[label_index, cv2.CC_STAT_AREA])
+            if area < 200 or area > int(image_area * 0.30):
+                continue
+
+            x = int(stats[label_index, cv2.CC_STAT_LEFT])
+            y = int(stats[label_index, cv2.CC_STAT_TOP])
+            region_width = int(stats[label_index, cv2.CC_STAT_WIDTH])
+            region_height = int(stats[label_index, cv2.CC_STAT_HEIGHT])
+            touches_full_border = (
+                x <= 2
+                and y <= 2
+                and (x + region_width) >= (width - 2)
+                and (y + region_height) >= (height - 2)
+            )
+            if touches_full_border:
+                continue
+
+            component_mask = np.zeros_like(mask, dtype=np.uint8)
+            component_mask[labels == label_index] = 255
+            mean_intensity = float(cv2.mean(candidate_image, mask=component_mask)[0])
+            area_ratio = area / image_area
+            size_score = 1.0 - min(abs(area_ratio - 0.02) / 0.02, 1.0)
+            score = (mean_intensity / 255.0) * 2.0 + size_score + min(area_ratio / 0.03, 1.0)
+
+            if score > best_score:
+                best_score = score
+                best_label = label_index
+
+        if best_label == 0:
+            return np.zeros_like(mask, dtype=np.uint8)
+
+        best_region = np.zeros_like(mask, dtype=np.uint8)
+        best_region[labels == best_label] = 255
+        return best_region
+
+    def _validate_single_region(self, mask: np.ndarray) -> np.ndarray:
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            return np.zeros_like(mask, dtype=np.uint8)
+
+        contour = max(contours, key=cv2.contourArea)
+        area = float(cv2.contourArea(contour))
+        image_area = float(mask.shape[0] * mask.shape[1])
+        x, y, width, height = cv2.boundingRect(contour)
+        touches_full_border = (
+            x <= 2
+            and y <= 2
+            and (x + width) >= (mask.shape[1] - 2)
+            and (y + height) >= (mask.shape[0] - 2)
+        )
+        if area < 200.0 or area > image_area * 0.30 or touches_full_border:
+            return np.zeros_like(mask, dtype=np.uint8)
+
+        validated = np.zeros_like(mask, dtype=np.uint8)
+        cv2.drawContours(validated, [contour], -1, 255, thickness=cv2.FILLED)
+        return validated
+
+    def _smooth_mask(self, mask: np.ndarray) -> np.ndarray:
+        blurred = cv2.GaussianBlur(mask, (9, 9), 0)
+        _, thresholded = cv2.threshold(blurred, 127, 255, cv2.THRESH_BINARY)
+        thresholded = cv2.morphologyEx(
+            thresholded,
+            cv2.MORPH_CLOSE,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9)),
+            iterations=1,
+        )
+        thresholded = cv2.erode(
+            thresholded,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
+            iterations=1,
+        )
+        thresholded = cv2.dilate(
+            thresholded,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)),
+            iterations=1,
+        )
+        return thresholded
+
+    def _largest_component(self, mask: np.ndarray) -> np.ndarray:
+        if np.count_nonzero(mask) == 0:
+            return np.zeros_like(mask, dtype=np.uint8)
+
+        component_count, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+        if component_count <= 1:
+            return mask.copy()
+
+        largest_label = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+        largest_mask = np.zeros_like(mask, dtype=np.uint8)
+        largest_mask[labels == largest_label] = 255
+        return largest_mask
+
+    def _extract_contour(self, mask: np.ndarray) -> Optional[np.ndarray]:
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            return None
+
+        contour = max(contours, key=cv2.contourArea)
+        return self._smooth_contour(contour)
+
+    def _smooth_contour(self, contour: np.ndarray) -> Optional[np.ndarray]:
+        points = contour.reshape(-1, 2).astype(np.float32)
+        point_count = len(points)
+        if point_count < 3:
+            return None
+        if point_count < 5:
+            return contour.astype(np.int32)
+
+        kernel_size = min(11, point_count if point_count % 2 == 1 else point_count - 1)
+        if kernel_size < 3:
+            return contour.astype(np.int32)
+        if kernel_size % 2 == 0:
+            kernel_size -= 1
+
+        radius = kernel_size // 2
+        gaussian_kernel = cv2.getGaussianKernel(kernel_size, 2.5).flatten()
+        padded_points = np.vstack([points[-radius:], points, points[:radius]])
+        smooth_x = np.convolve(padded_points[:, 0], gaussian_kernel, mode="valid")
+        smooth_y = np.convolve(padded_points[:, 1], gaussian_kernel, mode="valid")
+        smoothed_points = np.stack([smooth_x, smooth_y], axis=1)
+        return smoothed_points.reshape(-1, 1, 2).astype(np.int32)
+
+    def _draw_overlay(self, image: np.ndarray, contour: Optional[np.ndarray]) -> np.ndarray:
+        overlay = image.copy()
+        if contour is None or len(contour) == 0:
+            return overlay
+
+        cv2.drawContours(overlay, [contour], -1, (0, 255, 0), 2, lineType=cv2.LINE_AA)
         return overlay
 
-    def _extract_bounding_box(self, mask: np.ndarray) -> Optional[Dict[str, int]]:
+    def _get_bbox(self, mask: np.ndarray) -> Optional[Dict[str, int]]:
         if np.count_nonzero(mask) == 0:
             return None
+
         x, y, width, height = cv2.boundingRect(mask)
         return {
             "x": int(x),
@@ -90,11 +304,7 @@ class SegmentationService:
             "height": int(height),
         }
 
-    def _contour_count(self, mask: np.ndarray) -> int:
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        return len(contours)
-
 
 @lru_cache(maxsize=1)
-def get_segmentation_service() -> SegmentationService:
+def get_segmentation_service():
     return SegmentationService()

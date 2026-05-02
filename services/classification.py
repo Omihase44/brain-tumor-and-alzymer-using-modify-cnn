@@ -106,13 +106,17 @@ class ClinicalClassificationService:
         }
 
         LOGGER.info(
-            "Clinical prediction generated",
-            extra={
-                "tumor_detected": tumor_payload["detected"],
-                "tumor_grade": tumor_payload["grade"],
-                "alz_detected": alzheimer_payload["detected"],
-                "alz_stage": alzheimer_payload["stage"],
-            },
+            "Clinical classification result: "
+            "tumor_detected=%s (backend=%s, class=%s, confidence=%.2f), "
+            "alz_detected=%s (backend=%s, stage=%s, confidence=%.2f)",
+            tumor_payload["detected"],
+            tumor_payload["backend"],
+            tumor_payload.get("tumor_type"),
+            tumor_payload["confidence"],
+            alzheimer_payload["detected"],
+            alzheimer_payload["backend"],
+            alzheimer_payload["stage"],
+            alzheimer_payload["confidence"],
         )
 
         return {

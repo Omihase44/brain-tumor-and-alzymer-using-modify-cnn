@@ -1,0 +1,391 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>{{ report_context.report_title if report_context else 'Clinical Imaging Report' }}</title>
+    <style>
+        @page { size: A4; margin: 14mm; }
+        :root {
+            --primary: #0e5a7a;
+            --primary-dark: #083a4f;
+            --surface: #f8fbfc;
+            --surface-soft: #edf6fa;
+            --border: #d4e2e8;
+            --text: #1f2f38;
+            --muted: #637885;
+            --warning: #fff7ec;
+        }
+        * { box-sizing: border-box; }
+        body {
+            margin: 0;
+            font-family: "Segoe UI", Arial, sans-serif;
+            color: var(--text);
+            background: #ffffff;
+            line-height: 1.45;
+        }
+        .page {
+            max-width: 190mm;
+            margin: 0 auto;
+        }
+        .header {
+            display: grid;
+            grid-template-columns: 1.1fr 1.4fr 1fr;
+            gap: 14px;
+            padding-bottom: 12px;
+            border-bottom: 2px solid var(--border);
+            align-items: start;
+        }
+        .brand-title {
+            margin: 0;
+            font-size: 22px;
+            color: var(--primary-dark);
+        }
+        .brand-subtitle,
+        .meta-label,
+        .card-label,
+        .image-caption,
+        .disclaimer {
+            color: var(--muted);
+        }
+        .report-title {
+            margin: 0;
+            text-align: center;
+            color: var(--primary-dark);
+            font-size: 24px;
+        }
+        .meta {
+            text-align: right;
+        }
+        .meta-row + .meta-row {
+            margin-top: 8px;
+        }
+        .meta-label,
+        .card-label {
+            display: block;
+            font-size: 11px;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+            margin-bottom: 3px;
+        }
+        .meta-value,
+        .card-value {
+            font-size: 15px;
+            font-weight: 700;
+        }
+        .section {
+            margin-top: 18px;
+        }
+        .section-title {
+            margin: 0 0 8px;
+            color: var(--primary);
+            font-size: 18px;
+        }
+        .grid-2,
+        .grid-3,
+        .grid-4 {
+            display: grid;
+            gap: 12px;
+        }
+        .grid-2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+        .grid-3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+        .grid-4 { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+        .card,
+        .summary-table,
+        .note-panel,
+        .interpretation {
+            border: 1px solid var(--border);
+            border-radius: 10px;
+            background: #ffffff;
+            box-shadow: 0 8px 20px rgba(14, 90, 122, 0.06);
+        }
+        .card {
+            background: var(--surface);
+            padding: 12px 14px;
+        }
+        .summary-table {
+            overflow: hidden;
+        }
+        table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+        th,
+        td {
+            padding: 10px 12px;
+            border-bottom: 1px solid var(--border);
+            vertical-align: top;
+            text-align: left;
+        }
+        th {
+            width: 34%;
+            background: var(--surface-soft);
+            color: var(--primary-dark);
+        }
+        tr:last-child th,
+        tr:last-child td {
+            border-bottom: none;
+        }
+        .interpretation {
+            background: var(--warning);
+            padding: 14px;
+        }
+        .image-grid {
+            display: grid;
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+            gap: 12px;
+        }
+        .image-card {
+            border: 1px solid var(--border);
+            border-radius: 10px;
+            padding: 10px;
+            background: #ffffff;
+        }
+        .image-title {
+            margin: 0 0 8px;
+            color: var(--primary-dark);
+            font-size: 14px;
+            text-align: center;
+        }
+        .image-frame {
+            height: 230px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            background: var(--surface);
+            overflow: hidden;
+        }
+        .image-frame img {
+            width: 100%;
+            height: 100%;
+            object-fit: contain;
+            background: #ffffff;
+        }
+        .placeholder {
+            padding: 18px;
+            text-align: center;
+            color: var(--muted);
+            font-size: 14px;
+        }
+        .image-caption {
+            margin-top: 8px;
+            font-size: 12px;
+            text-align: center;
+        }
+        .note-panel {
+            padding: 14px;
+            min-height: 170px;
+        }
+        .note-panel h3 {
+            margin: 0 0 10px;
+            color: var(--primary-dark);
+            font-size: 15px;
+        }
+        .note-panel p,
+        .note-panel li {
+            font-size: 14px;
+        }
+        .note-panel ul {
+            margin: 0;
+            padding-left: 18px;
+        }
+        .signature {
+            margin-top: 20px;
+            display: flex;
+            justify-content: flex-end;
+        }
+        .signature-box {
+            width: 240px;
+            text-align: center;
+        }
+        .signature-line {
+            height: 42px;
+            border-bottom: 1px solid var(--muted);
+            margin-bottom: 8px;
+        }
+        .disclaimer {
+            margin-top: 16px;
+            font-size: 11px;
+            font-style: italic;
+        }
+        @media print {
+            .card,
+            .summary-table,
+            .note-panel,
+            .interpretation {
+                box-shadow: none;
+            }
+        }
+        @media (max-width: 800px) {
+            .header,
+            .grid-2,
+            .grid-3,
+            .grid-4,
+            .image-grid {
+                grid-template-columns: 1fr;
+            }
+            .meta {
+                text-align: left;
+            }
+            .report-title {
+                text-align: left;
+            }
+        }
+    </style>
+</head>
+<body>
+    {% set ctx = report_context or {} %}
+    <div class="page">
+        <header class="header">
+            <div>
+                <h1 class="brand-title">{{ ctx.system_name or 'NeuroDetect AI' }}</h1>
+                <div class="brand-subtitle">{{ ctx.system_subtitle or 'AI-assisted neuroimaging decision support' }}</div>
+            </div>
+            <div>
+                <h2 class="report-title">{{ ctx.report_title or 'Clinical Imaging Report' }}</h2>
+            </div>
+            <div class="meta">
+                <div class="meta-row">
+                    <span class="meta-label">Report ID</span>
+                    <span class="meta-value">{{ ctx.report_id or 'N/A' }}</span>
+                </div>
+                <div class="meta-row">
+                    <span class="meta-label">Report Date</span>
+                    <span class="meta-value">{{ ctx.report_date or 'N/A' }}</span>
+                </div>
+            </div>
+        </header>
+
+        <section class="section">
+            <h2 class="section-title">Patient Information</h2>
+            <div class="grid-2">
+                <div class="card">
+                    <span class="card-label">Patient Name</span>
+                    <span class="card-value">{{ ctx.patient.name if ctx.patient else 'N/A' }}</span>
+                </div>
+                <div class="card">
+                    <span class="card-label">Patient ID</span>
+                    <span class="card-value">{{ ctx.patient.patient_id if ctx.patient else 'N/A' }}</span>
+                </div>
+                <div class="card">
+                    <span class="card-label">Age</span>
+                    <span class="card-value">{{ ctx.patient.age if ctx.patient else 'N/A' }}</span>
+                </div>
+                <div class="card">
+                    <span class="card-label">Gender</span>
+                    <span class="card-value">{{ ctx.patient.gender if ctx.patient else 'N/A' }}</span>
+                </div>
+            </div>
+        </section>
+
+        <section class="section">
+            <h2 class="section-title">Scan Details</h2>
+            <div class="summary-table">
+                <table>
+                    <tbody>
+                        {% for label, value in ctx.scan_details or [] %}
+                        <tr>
+                            <th>{{ label }}</th>
+                            <td>{{ value }}</td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+        </section>
+
+        <section class="section">
+            <h2 class="section-title">AI Summary</h2>
+            <div class="summary-table">
+                <table>
+                    <tbody>
+                        {% for label, value in ctx.ai_summary or [] %}
+                        <tr>
+                            <th>{{ label }}</th>
+                            <td>{{ value }}</td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+        </section>
+
+        <section class="section">
+            <h2 class="section-title">Segmentation Summary</h2>
+            <div class="summary-table">
+                <table>
+                    <tbody>
+                        {% for label, value in ctx.segmentation_summary or [] %}
+                        <tr>
+                            <th>{{ label }}</th>
+                            <td>{{ value }}</td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+        </section>
+
+        <section class="section">
+            <h2 class="section-title">Imaging Results</h2>
+            <div class="image-grid">
+                {% for image in ctx.images or [] %}
+                <div class="image-card">
+                    <h3 class="image-title">{{ image.label }}</h3>
+                    <div class="image-frame">
+                        {% if image.src %}
+                        <img src="{{ image.src }}" alt="{{ image.label }}">
+                        {% else %}
+                        <div class="placeholder">Image unavailable</div>
+                        {% endif %}
+                    </div>
+                    <div class="image-caption">{{ image.label }}</div>
+                </div>
+                {% endfor %}
+            </div>
+        </section>
+
+        <section class="section">
+            <h2 class="section-title">Clinical Interpretation</h2>
+            <div class="interpretation">{{ ctx.clinical_interpretation or 'Interpretation unavailable.' }}</div>
+        </section>
+
+        <section class="section">
+            <div class="grid-3">
+                <div class="note-panel">
+                    <h3>Doctor Notes</h3>
+                    <p>{{ ctx.doctor_notes or 'Pending physician review.' }}</p>
+                </div>
+                <div class="note-panel">
+                    <h3>Prescription</h3>
+                    <ul>
+                        {% for item in ctx.prescription_items or [] %}
+                        <li>{{ item }}</li>
+                        {% endfor %}
+                    </ul>
+                </div>
+                <div class="note-panel">
+                    <h3>Follow-up Instructions</h3>
+                    <ul>
+                        {% for item in ctx.follow_up_items or [] %}
+                        <li>{{ item }}</li>
+                        {% endfor %}
+                    </ul>
+                </div>
+            </div>
+        </section>
+
+        <section class="signature">
+            <div class="signature-box">
+                <div class="signature-line"></div>
+                <strong>Reviewing Clinician</strong>
+                <div class="brand-subtitle">Authorized Medical Reviewer</div>
+            </div>
+        </section>
+
+        <div class="disclaimer">{{ ctx.disclaimer or '' }}</div>
+    </div>
+</body>
+</html>

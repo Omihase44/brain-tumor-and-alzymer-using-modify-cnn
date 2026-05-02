@@ -1,0 +1,183 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Medical Image Analysis</title>
+    <link rel="stylesheet" href="{% static 'style.css' %}">
+    <style>
+        .analysis-selector {
+            margin-bottom: 20px;
+        }
+        .analysis-selector label {
+            margin-right: 20px;
+            font-weight: bold;
+        }
+        .result-card {
+            border: 1px solid #ddd;
+            border-radius: 8px;
+            padding: 20px;
+            margin: 20px 0;
+            background-color: #f9f9f9;
+        }
+        .result-header {
+            background-color: #007bff;
+            color: white;
+            padding: 10px;
+            border-radius: 5px;
+            margin-bottom: 15px;
+        }
+        .probability-bar {
+            display: flex;
+            align-items: center;
+            margin: 5px 0;
+        }
+        .probability-label {
+            width: 150px;
+            font-weight: bold;
+        }
+        .probability-fill {
+            height: 20px;
+            background-color: #007bff;
+            border-radius: 3px;
+            margin-left: 10px;
+        }
+        .model-info {
+            background-color: #e9ecef;
+            padding: 15px;
+            border-radius: 5px;
+            margin-top: 20px;
+        }
+    </style>
+</head>
+<body>
+
+<h2>Medical Image Analysis System</h2>
+
+{% if messages %}
+    {% for message in messages %}
+        <div class="alert alert-{{ message.tags }}">{{ message }}</div>
+    {% endfor %}
+{% endif %}
+
+{% if not predicted_class %}
+<!-- Analysis Type Selection and Form -->
+<div class="analysis-selector">
+    <h3>Select Analysis Type:</h3>
+    <form method="GET" action="{% url 'analysis' %}">
+        <label>
+            <input type="radio" name="type" value="brain" {% if analysis_type == 'brain' %}checked{% endif %}>
+            Brain Tumor Detection
+        </label>
+        <label>
+            <input type="radio" name="type" value="alzheimer" {% if analysis_type == 'alzheimer' %}checked{% endif %}>
+            Alzheimer Disease Detection
+        </label>
+        <button type="submit" style="margin-left: 20px;">Switch Analysis Type</button>
+    </form>
+</div>
+
+<form method="POST" enctype="multipart/form-data">
+    {% csrf_token %}
+    <label for="name">Name:</label>
+    <input type="text" name="name" required><br><br>
+
+    <label for="age">Age:</label>
+    <input type="number" name="age" required><br><br>
+
+    <label for="contact">Contact:</label>
+    <input type="text" name="contact" required><br><br>
+
+    <label for="emailid">Email:</label>
+    <input type="email" name="emailid" required><br><br>
+
+    <label for="Username">Username:</label>
+    <input type="text" name="Username" required><br><br>
+
+    <label for="Image1">Upload MRI Image:</label>
+    <input type="file" name="Image1" accept="image/*" required><br><br>
+
+    <input type="hidden" name="analysis_type" value="{{ analysis_type }}">
+
+    <button type="submit">
+        {% if analysis_type == 'brain' %}
+            Analyze Brain Tumor
+        {% else %}
+            Analyze Alzheimer Disease
+        {% endif %}
+    </button>
+</form>
+
+{% else %}
+<!-- Results Display -->
+<div class="result-card">
+    <div class="result-header">
+        <h3>
+            {% if analysis_type == 'brain' %}
+                🧠 Brain Tumor Analysis Results
+            {% else %}
+                🧠 Alzheimer Disease Analysis Results
+            {% endif %}
+        </h3>
+    </div>
+
+    <div class="result-content">
+        {% if analysis_type == 'brain' %}
+            <p><strong>Detected Tumor Type:</strong> {{ tumor_type|title }}</p>
+            {% if grade != 'N/A' %}
+            <p><strong>Tumor Grade:</strong> {{ grade }}</p>
+            {% endif %}
+        {% else %}
+            <p><strong>Detected Stage:</strong> {{ predicted_class }}</p>
+        {% endif %}
+
+        <p><strong>Confidence:</strong> {{ confidence }}</p>
+
+        {% if model_validation_accuracy != 'N/A' %}
+        <p><strong>Model Validation Accuracy:</strong> {{ model_validation_accuracy }}</p>
+        {% endif %}
+
+        {% if model_test_accuracy != 'N/A' %}
+        <p><strong>Model Test Accuracy:</strong> {{ model_test_accuracy }}</p>
+        {% endif %}
+
+        <h4>Symptoms:</h4>
+        <p>{{ symptoms }}</p>
+
+        <h4>Recommended Treatment:</h4>
+        <p>{{ treatment }}</p>
+
+        {% if analysis_type == 'alzheimer' and all_probabilities %}
+        <h4>All Probabilities:</h4>
+        {% for stage, prob in all_probabilities.items %}
+        <div class="probability-bar">
+            <div class="probability-label">{{ stage }}:</div>
+            <div class="probability-fill" style="width: {{ prob|mul:100 }}px; max-width: 200px;"></div>
+            <span style="margin-left: 10px;">{{ "%.2f"|format(prob * 100) }}%</span>
+        </div>
+        {% endfor %}
+        {% endif %}
+    </div>
+</div>
+
+<div class="model-info">
+    <h4>🤖 AI Model Information</h4>
+    <p><strong>Analysis Type:</strong>
+        {% if analysis_type == 'brain' %}
+            Brain Tumor Classification (4 classes: Glioma, Meningioma, No Tumor, Pituitary)
+        {% else %}
+            Alzheimer Disease Staging (4 stages: Non-Demented, Very Mild, Mild, Moderate)
+        {% endif %}
+    </p>
+    <p><strong>Model Architecture:</strong> EfficientNetB0 with Transfer Learning</p>
+    <p><strong>Input Size:</strong> 224x224 RGB images</p>
+    <p><strong>Training Data:</strong> Medical MRI images with data augmentation</p>
+</div>
+
+<div style="text-align: center; margin-top: 20px;">
+    <a href="{% url 'analysis' %}" style="padding: 10px 20px; background-color: #007bff; color: white; text-decoration: none; border-radius: 5px;">Analyze Another Image</a>
+    <a href="/" style="padding: 10px 20px; background-color: #6c757d; color: white; text-decoration: none; border-radius: 5px; margin-left: 10px;">Back to Home</a>
+</div>
+
+{% endif %}
+
+</body>
+</html>

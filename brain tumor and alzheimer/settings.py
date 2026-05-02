@@ -76,12 +76,8 @@ WSGI_APPLICATION = 'brain tumor and alzheimer.wsgi.application'
 
 DATABASES = {
     'default': {
-        'ENGINE': 'django.db.backends.mysql',
-        'NAME': 'b_tumor',
-        'USER':'root',
-        'PASSWORD':'',
-        'HOST':'127.0.0.1',
-        'PORT':'3306',
+        'ENGINE': 'django.db.backends.sqlite3',
+        'NAME': os.path.join(BASE_DIR, 'db.sqlite3'),
     }
 }
 
@@ -125,6 +121,7 @@ USE_TZ = True
 STATIC_URL = '/static/'
 
 STATICFILES_DIRS = [
+    os.path.join(BASE_DIR,'static'),
     os.path.join(BASE_DIR,'b_tumor/static')
 ]
 

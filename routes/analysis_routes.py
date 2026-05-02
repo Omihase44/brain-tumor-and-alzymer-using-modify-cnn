@@ -64,6 +64,111 @@ def _normalize_confidence_value(value: object) -> float:
     return numeric_value
 
 
+def _normalize_detection_type(value: object) -> str:
+    normalized = str(value or "").strip().lower()
+    if normalized in {"alz", "alzheimer", "alzheimers", "alzheimer's"}:
+        return "alz"
+    if normalized in {"combined", "both", "all"}:
+        return "combined"
+    return "brain"
+
+
+def _resolve_asset_file(files: Dict[str, object], *keys: str) -> Optional[str]:
+    for key in keys:
+        value = files.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
+def _compute_segmentation_summary(
+    mask: np.ndarray,
+    voxel_config: Dict[str, float],
+    bounding_box: Optional[Dict[str, int]],
+    contour_count: int,
+) -> Dict[str, object]:
+    height, width = mask.shape[:2]
+    total_pixels = int(height * width)
+    white_pixel_count = int(np.count_nonzero(mask > 0))
+    tumor_area_percentage = round((white_pixel_count / total_pixels) * 100.0, 2) if total_pixels else 0.0
+    pixel_area_mm2 = round(float(voxel_config["pixel_spacing_x"]) * float(voxel_config["pixel_spacing_y"]), 4)
+    tumor_area_mm2 = round(white_pixel_count * pixel_area_mm2, 2)
+
+    bbox_payload = bounding_box or None
+    if bbox_payload:
+        bbox_payload = {
+            "x": int(bbox_payload.get("x") or 0),
+            "y": int(bbox_payload.get("y") or 0),
+            "width": int(bbox_payload.get("width") or 0),
+            "height": int(bbox_payload.get("height") or 0),
+            "width_mm": round(int(bbox_payload.get("width") or 0) * float(voxel_config["pixel_spacing_x"]), 2),
+            "height_mm": round(int(bbox_payload.get("height") or 0) * float(voxel_config["pixel_spacing_y"]), 2),
+        }
+
+    if contour_count and white_pixel_count > 0:
+        mask_quality = "clear" if tumor_area_percentage >= 0.05 else "limited"
+    elif white_pixel_count > 0:
+        mask_quality = "limited"
+    else:
+        mask_quality = "empty"
+
+    return {
+        "white_pixel_count": white_pixel_count,
+        "tumor_area_percentage": tumor_area_percentage,
+        "pixel_area_mm2": pixel_area_mm2,
+        "tumor_area_mm2": tumor_area_mm2,
+        "bounding_box": bbox_payload,
+        "mask_quality": mask_quality,
+    }
+
+
+def _resolve_accuracy_label(value: object, metrics: object) -> str:
+    metrics_payload = safe_dict(metrics)
+    accuracy_value = value if value not in (None, "") else metrics_payload.get("accuracy") or metrics_payload.get("accuracy_label")
+    if accuracy_value in (None, ""):
+        return "Unavailable"
+    if isinstance(accuracy_value, str):
+        normalized = accuracy_value.strip()
+        if normalized.endswith("%"):
+            return normalized
+        try:
+            accuracy_value = float(normalized)
+        except ValueError:
+            return normalized
+    numeric_value = float(accuracy_value)
+    if numeric_value <= 1:
+        numeric_value *= 100.0
+    return f"{numeric_value:.2f}".rstrip("0").rstrip(".") + "%"
+
+
+def _build_filtered_ai_result(analysis: Dict[str, object], detection_type: str) -> Dict[str, object]:
+    tumor_payload = safe_dict(analysis.get("tumor"))
+    alzheimers_payload = safe_dict(analysis.get("alzheimers"))
+    tumor_result = {
+        "type": "Brain Tumor",
+        "result": "Detected" if tumor_payload.get("detected") else "Not Detected",
+        "tumor_type": tumor_payload.get("tumor_type") or tumor_payload.get("classification") or "No Tumor",
+        "tumor_stage": tumor_payload.get("tumor_stage") or tumor_payload.get("grade") or "N/A",
+        "confidence": tumor_payload.get("confidence") or "N/A",
+        "model_accuracy": _resolve_accuracy_label(analysis.get("model_accuracy"), tumor_payload.get("model_metrics")),
+    }
+    alzheimer_result = {
+        "type": "Alzheimer",
+        "stage": alzheimers_payload.get("stage") or analysis.get("alzheimer_stage") or "NonDemented",
+        "confidence": alzheimers_payload.get("confidence") or "N/A",
+        "model_accuracy": _resolve_accuracy_label(
+            safe_dict(alzheimers_payload.get("model_metrics")).get("accuracy_label") or analysis.get("model_accuracy"),
+            alzheimers_payload.get("model_metrics"),
+        ),
+    }
+
+    if detection_type == "alz":
+        return alzheimer_result
+    if detection_type == "combined":
+        return {"brain_tumor": tumor_result, "alzheimer": alzheimer_result}
+    return tumor_result
+
+
 def _normalize_tumor_prediction(value: object) -> Dict[str, object]:
     result = safe_dict(value)
     detected = bool(result.get("detected", False))
@@ -136,11 +241,11 @@ def analyze_medical_image(
         tumor_detected=tumor_result["detected"],
         prepared_input=prepared_inputs.segmentation_input,
     )
-    mask = segmentation_result["mask"]
+    contour_mask = segmentation_result["mask"]
 
     voxel_config = normalize_voxel_metadata(voxel_metadata)
     volume_result = volume_service.calculate(
-        mask,
+        contour_mask,
         pixel_spacing_x=voxel_config["pixel_spacing_x"],
         pixel_spacing_y=voxel_config["pixel_spacing_y"],
         slice_thickness=voxel_config["slice_thickness"],
@@ -149,26 +254,37 @@ def analyze_medical_image(
     if not tumor_result["detected"]:
         volume_result["tumor_volume_mm3"] = 0.0
         volume_result["white_pixel_count"] = 0
-        mask[:, :] = 0
+        contour_mask[:, :] = 0
 
-    overlay = segmentation_result["overlay"]
+    boundary_overlay = segmentation_result["overlay"]
     assets = save_analysis_assets(
         {
-            "original_image": original_image,
+            "input_image": original_image,
             "enhanced_image": enhanced_image,
-            "overlay_image": overlay,
-            "mask_image": mask,
+            "mask": contour_mask,
+            "boundary_overlay": boundary_overlay,
         }
     )
+    asset_files = assets.get("files") if isinstance(assets.get("files"), dict) else {}
+    input_image_path = _resolve_asset_file(asset_files, "input_image", "original_image")
+    enhanced_image_path = _resolve_asset_file(asset_files, "enhanced_image")
+    mask_image_path = _resolve_asset_file(asset_files, "mask", "mask_image", "segmentation_mask", "display_mask")
+    boundary_image_path = _resolve_asset_file(asset_files, "boundary_overlay", "boundary_image", "overlay_image", "segmentation_overlay")
 
     original_base64 = encode_image_to_base64(original_image, ".png") if include_encoded_images else None
     enhanced_base64 = encode_image_to_base64(enhanced_image, ".png") if include_encoded_images else None
-    overlay_base64 = encode_image_to_base64(overlay, ".png") if include_encoded_images else None
-    mask_base64 = encode_image_to_base64(mask, ".png") if include_encoded_images else None
+    mask_base64 = encode_image_to_base64(contour_mask, ".png") if include_encoded_images else None
+    boundary_base64 = encode_image_to_base64(boundary_overlay, ".png") if include_encoded_images else None
     tumor_volume_mm3 = round(volume_result["tumor_volume_mm3"], 2)
     detection_type = (detection_type or "combined").lower()
     tumor_metrics = tumor_result.get("model_metrics") or get_model_metrics("brain_classifier")
     alzheimer_metrics = alzheimer_result.get("model_metrics") or get_model_metrics("alzheimer_classifier")
+    segmentation_summary = _compute_segmentation_summary(
+        contour_mask,
+        voxel_config=voxel_config,
+        bounding_box=segmentation_result["bounding_box"],
+        contour_count=int(segmentation_result["contour_count"] or 0),
+    )
 
     tumor_payload = {
         **tumor_result,
@@ -190,7 +306,6 @@ def analyze_medical_image(
         "confidence": _format_confidence(alzheimer_result["confidence"]),
         "model_metrics": alzheimer_metrics,
     }
-    mask_quality = "clear" if volume_result["white_pixel_count"] > 0 and segmentation_result["contour_count"] <= 3 else "review"
     tumor_accuracy_label = tumor_metrics.get("accuracy_label") or "Unavailable"
     tumor_accuracy_score = tumor_metrics.get("accuracy")
     alzheimer_accuracy_label = alzheimer_metrics.get("accuracy_label") or "Unavailable"
@@ -206,44 +321,48 @@ def analyze_medical_image(
         "enhancement": {
             "backend": prepared_inputs.enhancement_backend,
             "steps": prepared_inputs.enhancement_steps,
-            "original_image": assets["files"]["original_image"],
-            "enhanced_image": assets["files"]["enhanced_image"],
-            "original_image_base64": original_base64,
+            "input_image": input_image_path,
+            "enhanced_image": enhanced_image_path,
+            "input_image_base64": original_base64,
             "enhanced_image_base64": enhanced_base64,
         },
         "segmentation": {
             "available": bool(tumor_result["detected"]),
             "backend": segmentation_result["backend"],
-            "white_pixel_count": volume_result["white_pixel_count"],
+            "white_pixel_count": segmentation_summary["white_pixel_count"],
             "voxel_volume_mm3": volume_result["voxel_volume_mm3"],
-            "mask_image": assets["files"]["mask_image"],
-            "overlay_image": assets["files"]["overlay_image"],
-            "segmentation_overlay": assets["files"]["overlay_image"],
+            "tumor_area_percentage": segmentation_summary["tumor_area_percentage"],
+            "tumor_area_mm2": segmentation_summary["tumor_area_mm2"],
+            "pixel_area_mm2": segmentation_summary["pixel_area_mm2"],
+            "mask_quality": segmentation_summary["mask_quality"],
+            "mask_image": mask_image_path,
             "mask_image_base64": mask_base64,
-            "overlay_image_base64": overlay_base64,
-            "segmentation_overlay_base64": overlay_base64,
-            "bounding_box": segmentation_result["bounding_box"],
+            "boundary_image": boundary_image_path,
+            "segmentation_overlay": boundary_image_path,
+            "boundary_image_base64": boundary_base64,
+            "bounding_box": segmentation_summary["bounding_box"],
             "contour_count": segmentation_result["contour_count"],
-            "mask_quality": mask_quality,
         },
         "images": {
-            "original": {"path": assets["files"]["original_image"], "base64": original_base64},
-            "enhanced": {"path": assets["files"]["enhanced_image"], "base64": enhanced_base64},
-            "overlay": {"path": assets["files"]["overlay_image"], "base64": overlay_base64},
-            "mask": {"path": assets["files"]["mask_image"], "base64": mask_base64},
+            "input": {"path": input_image_path, "base64": original_base64},
+            "enhanced": {"path": enhanced_image_path, "base64": enhanced_base64},
+            "mask": {"path": mask_image_path, "base64": mask_base64},
+            "boundary": {"path": boundary_image_path, "base64": boundary_base64},
         },
         "study_id": assets["study_id"],
-        "original_image": assets["files"]["original_image"],
-        "enhanced_image": assets["files"]["enhanced_image"],
-        "overlay_image": assets["files"]["overlay_image"],
-        "mask_image": assets["files"]["mask_image"],
-        "original_image_base64": original_base64,
+        "input_image": input_image_path,
+        "enhanced_image": enhanced_image_path,
+        "mask_image": mask_image_path,
+        "boundary_image": boundary_image_path,
+        "segmentation_overlay": boundary_image_path,
+        "input_image_base64": original_base64,
         "enhanced_image_base64": enhanced_base64,
-        "segmentation_image": overlay_base64,
-        "segmentation_mask": mask_base64,
-        "segmentation_overlay": overlay_base64,
+        "mask_image_base64": mask_base64,
+        "boundary_image_base64": boundary_base64,
         "voxel_metadata": voxel_config,
-        "white_pixel_count": volume_result["white_pixel_count"],
+        "white_pixel_count": segmentation_summary["white_pixel_count"],
+        "tumor_area_percentage": segmentation_summary["tumor_area_percentage"],
+        "tumor_area_mm2": segmentation_summary["tumor_area_mm2"],
         "tumor_detected": tumor_result["detected"],
         "tumor_type": tumor_payload["tumor_type"],
         "tumor_grade": tumor_result["grade"],
@@ -264,12 +383,13 @@ def analyze_medical_image(
             "tumor_stage": tumor_payload["tumor_stage"],
             "tumor_confidence": tumor_payload["confidence"],
             "tumor_volume_mm3": tumor_volume_mm3,
+            "tumor_area_percentage": segmentation_summary["tumor_area_percentage"],
+            "tumor_area_mm2": segmentation_summary["tumor_area_mm2"],
             "model_accuracy": tumor_accuracy_label,
             "model_accuracy_score": tumor_accuracy_score,
             "alzheimer_stage": alzheimer_result["stage"],
             "alzheimer_model_accuracy": alzheimer_accuracy_label,
-            "segmentation_boundary": "Detected" if segmentation_result["contour_count"] else "Not detected",
-            "mask_quality": mask_quality,
+            "boundary_status": "Detected" if segmentation_result["contour_count"] else "Not detected",
         },
         "confidence": _format_confidence(
             max(float(tumor_result["confidence"]), float(alzheimer_result["confidence"]))
@@ -375,30 +495,27 @@ def analyze_route():
             if api_key not in configured_api_keys:
                 return jsonify({"success": False, "error": "Unauthorized API request."}), 401
 
+        detection_type = _normalize_detection_type(
+            request.form.get("type") or request.args.get("type") or _extract_json_payload().get("type") or "brain"
+        )
         image_bytes = _extract_request_image_bytes()
         analysis = analyze_medical_image(
             image_bytes=image_bytes,
-            detection_type="brain",
+            detection_type=detection_type,
             voxel_metadata=_extract_voxel_payload(),
-            include_encoded_images=False,
+            include_encoded_images=True,
         )
-        tumor_payload = safe_dict(analysis.get("tumor"))
+        images_payload = safe_dict(analysis.get("images"))
 
         return jsonify(
             {
                 "success": True,
-                "tumor": {
-                    "detected": tumor_payload.get("detected", False),
-                    "classification": tumor_payload.get("classification"),
-                    "tumor_type": tumor_payload.get("tumor_type"),
-                    "grade": tumor_payload.get("grade"),
-                    "tumor_stage": tumor_payload.get("tumor_stage"),
-                    "confidence": tumor_payload.get("confidence"),
-                    "model_metrics": tumor_payload.get("model_metrics"),
-                    "model_accuracy": (tumor_payload.get("model_metrics") or {}).get("accuracy_label"),
-                },
+                "input_image": safe_dict(images_payload.get("input")).get("base64"),
+                "enhanced_image": safe_dict(images_payload.get("enhanced")).get("base64"),
+                "mask_image": safe_dict(images_payload.get("mask")).get("base64"),
+                "boundary_image": safe_dict(images_payload.get("boundary")).get("base64"),
                 "segmentation": safe_dict(analysis.get("segmentation")),
-                "ai_clinical_insights": safe_dict(analysis.get("ai_clinical_insights")),
+                "ai_result": _build_filtered_ai_result(analysis, detection_type),
             }
         )
     except ModelUnavailableError as exc:

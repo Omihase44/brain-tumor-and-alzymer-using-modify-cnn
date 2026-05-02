@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import List, Optional
+import logging
+from typing import List, Optional, Tuple
 
 import numpy as np
 
@@ -8,9 +9,21 @@ from services.enhancement import ImageEnhancementService
 from utils.image_processing import (
     decode_image_bytes,
     ensure_three_channel,
-    preprocess_classifier_image,
+    preprocess_classifier_image_rgb,
     preprocess_segmentation_image,
 )
+from utils.tensorflow_compat import get_model_manifest_entry
+
+LOGGER = logging.getLogger(__name__)
+
+
+def _classifier_target_size() -> Tuple[int, int]:
+    """Read classifier input size from model manifest (defaults to 150x150)."""
+    entry = get_model_manifest_entry("brain_classifier")
+    input_shape = entry.get("input_shape")
+    if isinstance(input_shape, (list, tuple)) and len(input_shape) >= 2:
+        return (int(input_shape[0]), int(input_shape[1]))
+    return (150, 150)
 
 
 @dataclass(frozen=True)
@@ -43,10 +56,24 @@ class NeuroImagePreprocessingService:
         enhancement_result = self._enhancement_service.enhance(original_image)
         enhanced_image = enhancement_result["enhanced_image"]
 
+        # IMPORTANT: Classification uses the ORIGINAL image (not enhanced)
+        # converted to RGB to match ImageDataGenerator training pipelines.
+        # Enhancement (CLAHE, sharpening) was NOT used during training,
+        # so applying it here would cause distribution shift.
+        target_size = _classifier_target_size()
+        classifier_input = preprocess_classifier_image_rgb(original_image, target_size=target_size)
+
+        LOGGER.info(
+            "Preprocessing complete: classifier_input shape=%s (RGB, no enhancement, target=%s), "
+            "segmentation_input from enhanced image",
+            classifier_input.shape,
+            target_size,
+        )
+
         return PreparedAnalysisInputs(
             original_image=original_image,
             enhanced_image=enhanced_image,
-            classifier_input=preprocess_classifier_image(enhanced_image),
+            classifier_input=classifier_input,
             segmentation_input=preprocess_segmentation_image(enhanced_image),
             enhancement_backend=str(enhancement_result.get("backend") or "opencv"),
             enhancement_steps=list(enhancement_result.get("steps") or []),
@@ -56,3 +83,4 @@ class NeuroImagePreprocessingService:
 @lru_cache(maxsize=1)
 def get_preprocessing_service() -> NeuroImagePreprocessingService:
     return NeuroImagePreprocessingService()
+

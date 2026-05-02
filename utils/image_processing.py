@@ -91,9 +91,27 @@ def preprocess_classifier_image(
     image: np.ndarray,
     target_size: tuple[int, int] = (224, 224),
 ) -> np.ndarray:
-    """Prepare a 3-channel image for classification models."""
+    """Prepare a 3-channel image for classification models (keeps BGR order)."""
     image = ensure_three_channel(image)
     resized = cv2.resize(image, target_size, interpolation=cv2.INTER_CUBIC)
+    normalized = np.clip(resized.astype(np.float32) / 255.0, 0.0, 1.0)
+    return np.expand_dims(normalized, axis=0)
+
+
+def preprocess_classifier_image_rgb(
+    image: np.ndarray,
+    target_size: tuple[int, int] = (224, 224),
+) -> np.ndarray:
+    """Prepare an image for Keras classification models trained with ImageDataGenerator.
+
+    Training pipelines (ImageDataGenerator, PIL) work in RGB colour order.
+    OpenCV loads images as BGR, so this function converts BGR→RGB before
+    resizing and normalising to [0, 1].  This ensures the channel order
+    seen at inference matches what the model saw during training.
+    """
+    image = ensure_three_channel(image)
+    rgb_image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    resized = cv2.resize(rgb_image, target_size, interpolation=cv2.INTER_CUBIC)
     normalized = np.clip(resized.astype(np.float32) / 255.0, 0.0, 1.0)
     return np.expand_dims(normalized, axis=0)
 

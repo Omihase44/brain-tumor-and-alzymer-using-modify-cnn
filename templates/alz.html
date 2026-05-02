@@ -1,20 +1,70 @@
 <!DOCTYPE html>
 <html>
 <head>
-    <title>Alzheimer Detection</title>
+    <title>Alzheimer Disease Detection</title>
     <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
 </head>
 <body>
 
-<h2>Alzheimer Detection</h2>
+<h2>Alzheimer Disease Detection</h2>
+
+{% if messages %}
+    {% for message in messages %}
+        <div class="alert alert-{{ message.tags }}">{{ message }}</div>
+    {% endfor %}
+{% endif %}
 
 <form method="POST" enctype="multipart/form-data">
-    <input type="file" name="file" required><br><br>
-    <button type="submit">Predict</button>
+    {% csrf_token %}
+    <label for="name">Name:</label>
+    <input type="text" name="name" required><br><br>
+    
+    <label for="age">Age:</label>
+    <input type="number" name="age" required><br><br>
+    
+    <label for="contact">Contact:</label>
+    <input type="text" name="contact" required><br><br>
+    
+    <label for="emailid">Email:</label>
+    <input type="email" name="emailid" required><br><br>
+    
+    <label for="Username">Username:</label>
+    <input type="text" name="Username" required><br><br>
+    
+    <label for="Image1">Upload MRI Image:</label>
+    <input type="file" name="Image1" accept="image/*" required><br><br>
+    
+    <button type="submit">Predict Alzheimer Stage</button>
 </form>
 
+{% if predicted_class %}
+<div class="result">
+    <h3>Prediction Results</h3>
+    <p><strong>Detected Stage:</strong> {{ predicted_class }}</p>
+    <p><strong>Confidence:</strong> {{ "%.2f"|format(confidence * 100) }}%</p>
+    {% if model_accuracy %}
+    <p><strong>Model Accuracy:</strong> {{ "%.2f"|format(model_accuracy * 100) }}%</p>
+    {% endif %}
+    
+    {% if all_probabilities %}
+    <h4>All Probabilities:</h4>
+    <ul>
+        {% for class_name, prob in all_probabilities.items() %}
+        <li>{{ class_name }}: {{ "%.2f"|format(prob * 100) }}%</li>
+        {% endfor %}
+    </ul>
+    {% endif %}
+    
+    <h4>Symptoms:</h4>
+    <p>{{ symptoms }}</p>
+    
+    <h4>Treatment:</h4>
+    <p>{{ treatment }}</p>
+</div>
+{% endif %}
+
 <br>
-<a href="/">Back</a>
+<a href="/">Back to Home</a>
 
 </body>
 </html>

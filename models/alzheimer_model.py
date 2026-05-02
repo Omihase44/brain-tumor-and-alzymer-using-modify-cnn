@@ -57,13 +57,13 @@ def normalize_alzheimer_stage_label(stage: Optional[str]) -> Optional[str]:
 def build_alzheimer_staging_model(
     input_shape: tuple[int, int, int] = (224, 224, 3),
     num_classes: int = 4,
-    variant: str = "cnn",
+    variant: str = "efficientnetb0",
     weights: str = "imagenet",
-    dense_units: int = 256,
-    dropout_rate: float = 0.5,
-    fine_tune_layers: int = 0,
+    dense_units: int = 512,
+    dropout_rate: float = 0.4,
+    fine_tune_layers: int = 50,
 ) -> Optional[Any]:
-    """Build a modified CNN or transfer-learning model for Alzheimer staging."""
+    """Build an advanced CNN or transfer-learning model for Alzheimer staging with data augmentation."""
     tensorflow_keras = get_tensorflow_keras()
     if not tensorflow_keras["available"]:
         return None
@@ -80,9 +80,10 @@ def build_alzheimer_staging_model(
     Model = models.Model
 
     inputs = Input(shape=input_shape)
-    normalized_variant = str(variant or "cnn").strip().lower()
+    normalized_variant = str(variant or "efficientnetb0").strip().lower()
 
     if normalized_variant == "cnn":
+        # Enhanced CNN architecture with more layers
         x = Conv2D(32, (3, 3), activation="relu", padding="same")(inputs)
         x = BatchNormalization()(x)
         x = MaxPooling2D((2, 2))(x)
@@ -92,6 +93,9 @@ def build_alzheimer_staging_model(
         x = Conv2D(128, (3, 3), activation="relu", padding="same")(x)
         x = BatchNormalization()(x)
         x = MaxPooling2D((2, 2))(x)
+        x = Conv2D(256, (3, 3), activation="relu", padding="same")(x)
+        x = BatchNormalization()(x)
+        x = MaxPooling2D((2, 2))(x)
         x = Flatten()(x)
     else:
         applications = importlib.import_module("tensorflow.keras.applications")
@@ -99,8 +103,13 @@ def build_alzheimer_staging_model(
             "mobilenetv2": importlib.import_module("tensorflow.keras.applications.mobilenet_v2"),
             "resnet50": importlib.import_module("tensorflow.keras.applications.resnet50"),
             "vgg16": importlib.import_module("tensorflow.keras.applications.vgg16"),
+            "efficientnetb0": importlib.import_module("tensorflow.keras.applications.efficientnet"),
         }
-        if normalized_variant == "mobilenetv2":
+
+        if normalized_variant == "efficientnetb0":
+            backbone_class = applications.EfficientNetB0
+            preprocessing = preprocessing_layers["efficientnetb0"].preprocess_input
+        elif normalized_variant == "mobilenetv2":
             backbone_class = applications.MobileNetV2
             preprocessing = preprocessing_layers["mobilenetv2"].preprocess_input
         elif normalized_variant == "resnet50":
@@ -112,13 +121,24 @@ def build_alzheimer_staging_model(
         else:
             raise ValueError(f"Unsupported Alzheimer model variant: {variant}")
 
-        rescaled_inputs = layers.Rescaling(255.0, name=f"{normalized_variant}_rescale")(inputs)
+        # Data augmentation layers
+        data_augmentation = models.Sequential([
+            layers.RandomFlip("horizontal"),
+            layers.RandomRotation(0.1),
+            layers.RandomZoom(0.1),
+            layers.RandomContrast(0.1),
+        ], name="data_augmentation")
+
+        augmented_inputs = data_augmentation(inputs)
+        rescaled_inputs = layers.Rescaling(255.0, name=f"{normalized_variant}_rescale")(augmented_inputs)
         processed_inputs = layers.Lambda(preprocessing, name=f"{normalized_variant}_preprocess")(rescaled_inputs)
+
         base_model = backbone_class(
             include_top=False,
             weights=None if str(weights).lower() == "none" else weights,
             input_shape=input_shape,
         )
+
         if fine_tune_layers > 0:
             base_model.trainable = True
             frozen_boundary = max(len(base_model.layers) - int(fine_tune_layers), 0)
@@ -128,12 +148,17 @@ def build_alzheimer_staging_model(
                 layer.trainable = True
         else:
             base_model.trainable = False
+
         x = base_model(processed_inputs, training=False)
         x = layers.GlobalAveragePooling2D()(x)
 
-    x = Dense(dense_units, activation="relu")(x)
+    # Enhanced dense layers with regularization
+    x = Dense(dense_units, activation="relu", kernel_regularizer="l2")(x)
+    x = BatchNormalization()(x)
     x = Dropout(dropout_rate)(x)
-    outputs = Dense(num_classes, activation="softmax", name="cdr_stage")(x)
+    x = Dense(dense_units // 2, activation="relu", kernel_regularizer="l2")(x)
+    x = Dropout(dropout_rate)(x)
+    outputs = Dense(num_classes, activation="softmax", name="alzheimer_stage")(x)
     return Model(inputs=inputs, outputs=outputs, name=f"alzheimer_staging_model_{normalized_variant}")
 
 
@@ -156,10 +181,10 @@ class AlzheimerStagingModel:
         return safe_load_keras_model(self.model_path)
 
     def _resolve_class_names(self):
-        metadata_classes = self.metadata.get("class_names")
+        metadata_classes = self.metadata.get("class_names") or self.metadata.get("classes")
         if isinstance(metadata_classes, list) and metadata_classes:
             return [str(name) for name in metadata_classes]
-        return list(LEGACY_ALZHEIMER_CLASSES)
+        return list(ALZHEIMER_STAGE_CLASSES)
 
     def predict(self, image: np.ndarray, prepared_image: Optional[np.ndarray] = None) -> Dict[str, object]:
         features = extract_radiology_features(image)

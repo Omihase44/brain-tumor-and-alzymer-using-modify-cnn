@@ -1039,6 +1039,7 @@
     <script>
         let currentUser = null;
         let currentPatientDetails = null;
+        let activeReportId = null;
         let chatPartnerId = null;
         let socket = null;
         let appointmentCatalog = {specialties: [], doctors: []};
@@ -1274,6 +1275,17 @@
             return statusMap[status] || status;
         }
         
+        function getStatusText(status) {
+            const statusMap = {
+                pending: 'Pending Review',
+                reviewed: 'Draft',
+                approved: 'Approved',
+                rejected: 'Rejected',
+                sent: 'Sent'
+            };
+            return statusMap[status] || status;
+        }
+
         function getPatientReportTumorDetails(report) {
             const tumor = report.analysis?.tumor || {};
             return {
@@ -1290,8 +1302,6 @@
         function getPatientReportModelAccuracy(report) {
             return report.model_accuracy
                 || report.analysis?.model_accuracy
-                || report.analysis?.tumor?.model_metrics?.accuracy_label
-                || report.model_metrics?.tumor?.accuracy_label
                 || 'Unavailable';
         }
 
@@ -1299,10 +1309,16 @@
             try {
                 const response = await fetch(`/api/patient/report/${reportId}`);
                 const data = await response.json();
+                if (!response.ok || !data.report) {
+                    throw new Error(data.error || 'Report not found');
+                }
+                activeReportId = reportId;
                 const report = data.report;
+                const detailedInfo = report.detailed_info || {};
                 const tumorDetails = getPatientReportTumorDetails(report);
                 const alzheimerStage = getPatientReportAlzheimerStage(report);
                 const modelAccuracy = getPatientReportModelAccuracy(report);
+                const reportDownloadUrl = report.report_download_url || `/generate-report/${reportId}`;
                 
                 const modal = new bootstrap.Modal(document.getElementById('reportModal'));
                 const content = document.getElementById('reportModalContent');
@@ -1311,6 +1327,7 @@
                     <div class="info-card">
                         <h6><i class="fas fa-robot me-2"></i>AI Analysis Results</h6>
                         <p><strong>Detection Type:</strong> ${report.type === 'brain' ? 'Brain Tumor' : "Alzheimer's"}</p>
+                        <p><strong>Status:</strong> ${escapeHtml(getStatusText(report.status || 'pending'))}</p>
                         <p><strong>Result:</strong> ${escapeHtml(report.result || 'Unavailable')}</p>
                         <p><strong>Tumor Type:</strong> ${escapeHtml(tumorDetails.type)}</p>
                         <p><strong>Tumor Stage:</strong> ${escapeHtml(tumorDetails.stage)}</p>
@@ -1325,25 +1342,25 @@
                     
                     <div class="info-card">
                         <h6><i class="fas fa-info-circle me-2"></i>Detailed Information</h6>
-                        <p><strong>Description:</strong> ${report.detailed_info.description}</p>
-                        <p><strong>Symptoms:</strong> ${report.detailed_info.symptoms}</p>
-                        <p><strong>Treatment:</strong> ${report.detailed_info.treatment}</p>
-                        <p><strong>Severity:</strong> ${report.detailed_info.severity}</p>
-                        <p><strong>Urgency:</strong> ${report.detailed_info.urgency}</p>
+                        <p><strong>Description:</strong> ${escapeHtml(detailedInfo.description || 'Not available')}</p>
+                        <p><strong>Symptoms:</strong> ${escapeHtml(detailedInfo.symptoms || 'Not available')}</p>
+                        <p><strong>Treatment:</strong> ${escapeHtml(detailedInfo.treatment || 'Not available')}</p>
+                        <p><strong>Severity:</strong> ${escapeHtml(detailedInfo.severity || 'Not available')}</p>
+                        <p><strong>Urgency:</strong> ${escapeHtml(detailedInfo.urgency || 'Not available')}</p>
                     </div>
                     
                     ${report.doctor_notes ? `
                     <div class="info-card">
                         <h6><i class="fas fa-user-md me-2"></i>Doctor's Review</h6>
-                        <p><strong>Notes:</strong> ${report.doctor_notes}</p>
-                        ${report.prescription ? `<p><strong>Prescription:</strong> ${report.prescription}</p>` : ''}
-                        ${report.follow_up ? `<p><strong>Follow-up:</strong> ${report.follow_up}</p>` : ''}
+                        <p><strong>Notes:</strong> ${escapeHtml(report.doctor_notes)}</p>
+                        ${report.prescription ? `<p><strong>Prescription:</strong> ${escapeHtml(report.prescription)}</p>` : ''}
+                        ${report.follow_up ? `<p><strong>Follow-up:</strong> ${escapeHtml(report.follow_up)}</p>` : ''}
                     </div>
                     ` : '<div class="info-card"><p class="text-muted"><i class="fas fa-hourglass-half me-2"></i>Waiting for doctor to review your report.</p></div>'}
                     
                     <div class="d-flex justify-content-between mt-3">
-                        ${report.status === 'sent' || report.status === 'approved' ? `
-                        <a href="/api/patient/report/${reportId}/download" class="btn btn-primary w-100">
+                        ${(report.download_enabled || report.report_ready) ? `
+                        <a href="${escapeHtml(reportDownloadUrl)}" class="btn btn-primary w-100">
                             <i class="fas fa-download me-2"></i>Download PDF Report
                         </a>
                         ` : ''}
@@ -1522,6 +1539,9 @@
                 }
                 const normalizedStatus = String(data.status || '').toLowerCase();
                 loadReports();
+                if (activeReportId && Number(data.report_id) === Number(activeReportId)) {
+                    viewReport(activeReportId);
+                }
                 if (normalizedStatus === 'sent' || normalizedStatus === 'approved') {
                     showAlert('Your report is ready for review.', 'success');
                 } else if (normalizedStatus === 'rejected') {
@@ -2361,6 +2381,13 @@
             } catch (error) {
                 console.error('Auth check failed:', error);
             }
+        }
+
+        const patientReportModal = document.getElementById('reportModal');
+        if (patientReportModal) {
+            patientReportModal.addEventListener('hidden.bs.modal', () => {
+                activeReportId = null;
+            });
         }
         
         checkAuth();
