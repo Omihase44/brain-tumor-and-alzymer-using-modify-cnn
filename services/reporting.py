@@ -359,7 +359,6 @@ def build_report_context(report: dict) -> Dict[str, object]:
         "images": [
             {"label": "Input Image", "value": input_image, "src": _to_image_src(input_image), "sharpen": False},
             {"label": "Enhanced Image", "value": enhanced_image, "src": _to_image_src(enhanced_image), "sharpen": True},
-            {"label": "Segmentation Mask", "value": mask_image, "src": _to_image_src(mask_image), "sharpen": False},
             {"label": "Boundary Overlay", "value": boundary_image, "src": _to_image_src(boundary_image), "sharpen": True},
         ],
     }
@@ -599,11 +598,19 @@ def build_medical_report_pdf(report: dict) -> io.BytesIO:
         _build_image_card(image["label"], image["value"], styles, 80 * mm, sharpen=bool(image.get("sharpen")))
         for image in context["images"]
     ]
+    
+    # Pack image cards into pairs for the grid
+    grid_rows = []
+    for i in range(0, len(image_cards), 2):
+        row = [image_cards[i]]
+        if i + 1 < len(image_cards):
+            row.append(image_cards[i+1])
+        else:
+            row.append("")  # Empty cell
+        grid_rows.append(row)
+        
     imaging_grid = Table(
-        [
-            [image_cards[0], image_cards[1]],
-            [image_cards[2], image_cards[3]],
-        ],
+        grid_rows,
         colWidths=[88 * mm, 88 * mm],
     )
     imaging_grid.setStyle(

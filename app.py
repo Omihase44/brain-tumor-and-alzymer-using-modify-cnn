@@ -1,5 +1,6 @@
 from flask import Flask, render_template, request, jsonify, session, redirect, url_for, flash, send_file, send_from_directory
 from flask_cors import CORS
+from services.image_validator import ImageValidator
 from functools import wraps
 import logging
 import os
@@ -1246,6 +1247,9 @@ def predict():
     if not image_bytes:
         return jsonify({'error': 'Uploaded image is empty'}), 400
 
+    if not ImageValidator.is_valid_mri(image_bytes):
+        return jsonify({'error': 'Invalid image uploaded. Please upload only brain MRI images related to tumor or Alzheimer detection.'}), 400
+
     detection_type = normalize_detection_type(
         request.form.get('type') or request.form.get('detection_type') or 'brain'
     )
@@ -1578,6 +1582,9 @@ def patient_upload():
             image_bytes = file.read()
             if not image_bytes:
                 return jsonify({'error': 'Uploaded image is empty'}), 400
+
+            if not ImageValidator.is_valid_mri(image_bytes):
+                return jsonify({'error': 'Invalid image uploaded. Please upload only brain MRI images related to tumor or Alzheimer detection.'}), 400
 
             analysis = analyze_medical_image(
                 image_bytes=image_bytes,
@@ -2020,6 +2027,6 @@ if __name__ == '__main__':
     port = int(os.environ.get('PORT', '5000'))
     debug_mode = os.environ.get('FLASK_DEBUG', '').lower() in {'1', 'true', 'yes'}
     print(f"==================================================")
-    print(f"🚀 NeuroDetect Server is running at http://localhost:{port}")
+    print(f"[SUCCESS] NeuroDetect Server is running at http://localhost:{port}")
     print(f"==================================================")
     socketio.run(app, debug=debug_mode, use_reloader=False, host='0.0.0.0', port=port, allow_unsafe_werkzeug=True)

@@ -236,7 +236,7 @@ def analyze_medical_image(
     tumor_result = _normalize_tumor_prediction(classification_result.get("tumor"))
     alzheimer_result = _normalize_alzheimers_prediction(classification_result.get("alzheimers"))
     segmentation_result = segmentation_service.segment(
-        original_image=original_image,
+        original_image=enhanced_image,
         working_image=enhanced_image,
         tumor_detected=tumor_result["detected"],
         prepared_input=prepared_inputs.segmentation_input,

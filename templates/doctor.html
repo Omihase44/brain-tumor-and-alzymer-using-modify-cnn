@@ -1814,12 +1814,27 @@
         }
 
         function resolveImageSource(imageValue) {
-            const normalizedValue = String(imageValue || '').trim();
+            let normalizedValue = String(imageValue || '').trim();
             if (!normalizedValue) {
                 return '';
             }
-            if (normalizedValue.startsWith('data:') || normalizedValue.startsWith('/') || normalizedValue.startsWith('http')) {
+            if (normalizedValue.startsWith('data:') || normalizedValue.startsWith('http')) {
                 return normalizedValue;
+            }
+            
+            // Normalize Windows backslashes to forward slashes
+            normalizedValue = normalizedValue.replace(/\\/g, '/');
+            
+            // Check if it's already an absolute path
+            // Exclude strings that look like base64 (very long)
+            if (normalizedValue.startsWith('/') && normalizedValue.length < 200) {
+                return normalizedValue;
+            }
+            
+            // Check if it's a file path by looking for common extensions or a directory structure
+            // Use length constraint to avoid matching base64 strings which can contain '/'
+            if (normalizedValue.match(/\.(jpeg|jpg|gif|png|dcm)$/i) || (normalizedValue.includes('/') && normalizedValue.length < 200)) {
+                return '/' + normalizedValue;
             }
             return `data:image/png;base64,${normalizedValue}`;
         }
@@ -1829,7 +1844,6 @@
             const imageEntries = [
                 {label: 'Input Image', value: reportImages.input_image || report.input_image || report.image},
                 {label: 'Enhanced MRI', value: reportImages.enhanced_image || report.enhanced_image || report.enhanced_mri},
-                {label: 'Segmentation Mask', value: reportImages.mask_image || report.mask_image || report.segmentation_mask},
                 {label: 'Boundary Image', value: reportImages.boundary_image || report.boundary_image || report.segmentation_overlay || report.segmentation_image}
             ].filter((entry) => entry.value);
 

@@ -127,27 +127,122 @@ class TumorSegmentationModel:
 
     def _heuristic_mask(self, normalized_image: np.ndarray) -> np.ndarray:
         image_u8 = np.clip(normalized_image * 255.0, 0, 255).astype(np.uint8)
-        blurred = cv2.GaussianBlur(image_u8, (5, 5), 0.8)
-
-        _, otsu_mask = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        percentile_value = int(np.percentile(blurred, 90))
-        _, high_intensity_mask = cv2.threshold(blurred, percentile_value, 255, cv2.THRESH_BINARY)
-        mask = cv2.bitwise_and(otsu_mask, high_intensity_mask)
-
-        kernel = np.ones((3, 3), np.uint8)
-        mask = cv2.threshold(mask, 32, 255, cv2.THRESH_BINARY)[1]
-        mask = cv2.erode(mask, kernel, iterations=1)
-        mask = cv2.dilate(mask, kernel, iterations=2)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+        
+        # 0. Advanced Skull Stripping
+        # Separate the skull from the brain using morphological opening
+        _, thresh = cv2.threshold(image_u8, 15, 255, cv2.THRESH_BINARY)
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+        opened = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel, iterations=3)
+        
+        contours, _ = cv2.findContours(opened, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if contours:
+            largest_contour = max(contours, key=cv2.contourArea)
+            brain_mask = np.zeros_like(image_u8)
+            cv2.drawContours(brain_mask, [largest_contour], -1, 255, thickness=cv2.FILLED)
+            
+            # Erode slightly to remove the bright outer skull/meninges ring
+            brain_mask = cv2.erode(brain_mask, kernel, iterations=2)
+            image_u8 = cv2.bitwise_and(image_u8, brain_mask)
+            
+        blurred = cv2.bilateralFilter(image_u8, 9, 75, 75)
+        
+        # 1. K-Means Clustering to find bright regions
+        pixel_values = blurred.reshape((-1, 1)).astype(np.float32)
+        criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 100, 0.2)
+        _, labels, centers = cv2.kmeans(pixel_values, 4, None, criteria, 10, cv2.KMEANS_RANDOM_CENTERS)
+        
+        brightest_cluster = np.argmax(centers)
+        mask = (labels == brightest_cluster).reshape(image_u8.shape).astype(np.uint8) * 255
+        
+        # Fallback if mask is too large or too small
+        mask_area = np.count_nonzero(mask)
+        total_area = image_u8.shape[0] * image_u8.shape[1]
+        if mask_area < total_area * 0.001 or mask_area > total_area * 0.15:
+            percentile_value = int(np.percentile(blurred[blurred > 10], 96))
+            _, mask = cv2.threshold(blurred, percentile_value, 255, cv2.THRESH_BINARY)
+            
+        # Light morphological operations to connect nearby pixels
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=1)
+        
+        # 2. Find the best tumor component using Solidity and Circularity
+        best_component = self._find_best_tumor_blob(mask)
+        if np.count_nonzero(best_component) == 0:
+            return best_component
 
-        largest_component = self._largest_component(mask)
-        if np.count_nonzero(largest_component) == 0:
-            percentile_value = int(np.percentile(blurred, 95))
-            _, fallback_mask = cv2.threshold(blurred, percentile_value, 255, cv2.THRESH_BINARY)
-            largest_component = self._largest_component(self._refine_mask(fallback_mask))
+        # 3. Apply GrabCut for Pixel-Perfect Boundaries
+        try:
+            img_3c = cv2.cvtColor(image_u8, cv2.COLOR_GRAY2BGR)
+            # Initialize entire image as probable background so GrabCut can expand the foreground
+            grabcut_mask = np.full(image_u8.shape, cv2.GC_PR_BGD, dtype=np.uint8)
+            
+            # The selected blob is probable foreground
+            grabcut_mask[best_component > 0] = cv2.GC_PR_FGD
+            
+            # Erode the blob to get sure foreground
+            sure_fg = cv2.erode(best_component, np.ones((5,5), np.uint8), iterations=2)
+            grabcut_mask[sure_fg > 0] = cv2.GC_FGD
+            
+            # Dilate the blob to restrict GrabCut to a local region. Outside is sure background.
+            local_region = cv2.dilate(best_component, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (45, 45)), iterations=1)
+            
+            # Dark pixels and pixels far from the tumor are sure background
+            _, dark_bg = cv2.threshold(blurred, 40, 255, cv2.THRESH_BINARY_INV)
+            sure_bg = cv2.bitwise_or(dark_bg, cv2.bitwise_not(local_region))
+            grabcut_mask[sure_bg > 0] = cv2.GC_BGD
 
-        return largest_component
+            bgdModel = np.zeros((1,65),np.float64)
+            fgdModel = np.zeros((1,65),np.float64)
+            
+            cv2.grabCut(img_3c, grabcut_mask, None, bgdModel, fgdModel, 5, cv2.GC_INIT_WITH_MASK)
+            final_mask = np.where((grabcut_mask == cv2.GC_FGD) | (grabcut_mask == cv2.GC_PR_FGD), 255, 0).astype(np.uint8)
+            
+            return self._largest_component(final_mask)
+        except Exception:
+            return best_component
+
+    def _find_best_tumor_blob(self, mask: np.ndarray) -> np.ndarray:
+        if np.count_nonzero(mask) == 0:
+            return np.zeros_like(mask, dtype=np.uint8)
+
+        component_count, labels, stats, _ = cv2.connectedComponentsWithStats(mask, 8)
+        if component_count <= 1:
+            return mask
+
+        best_label = -1
+        best_score = -1.0
+        
+        for i in range(1, component_count):
+            area = stats[i, cv2.CC_STAT_AREA]
+            if area < 30:
+                continue
+                
+            comp_mask = (labels == i).astype(np.uint8) * 255
+            contours, _ = cv2.findContours(comp_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            if not contours:
+                continue
+                
+            contour = contours[0]
+            perimeter = cv2.arcLength(contour, True)
+            if perimeter == 0:
+                continue
+                
+            circularity = 4 * np.pi * (area / (perimeter * perimeter))
+            hull = cv2.convexHull(contour)
+            hull_area = cv2.contourArea(hull)
+            solidity = float(area) / hull_area if hull_area > 0 else 0
+            
+            # Tumors are usually solid blobs. Skull edges are long/thin (low circularity/solidity)
+            score = area * circularity * (solidity ** 2)
+            if score > best_score:
+                best_score = score
+                best_label = i
+                
+        result = np.zeros_like(mask, dtype=np.uint8)
+        if best_label != -1:
+            result[labels == best_label] = 255
+        return result
 
     def _largest_component(self, mask: np.ndarray) -> np.ndarray:
         num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask, 8)

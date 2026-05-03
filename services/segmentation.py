@@ -99,6 +99,12 @@ class SegmentationService:
         largest_contour = max(contours, key=cv2.contourArea)
         brain_mask = np.zeros_like(grayscale, dtype=np.uint8)
         cv2.drawContours(brain_mask, [largest_contour], -1, 255, thickness=cv2.FILLED)
+        
+        # Cut off the bottom 15% of the brain mask bounding box to remove the neck/jaw area
+        x, y, w, h = cv2.boundingRect(largest_contour)
+        cutoff_y = int(y + h * 0.85)
+        brain_mask[cutoff_y:, :] = 0
+        
         brain_mask = cv2.morphologyEx(
             brain_mask,
             cv2.MORPH_CLOSE,
@@ -107,19 +113,34 @@ class SegmentationService:
         )
         brain_mask = cv2.erode(
             brain_mask,
-            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11, 11)),
-            iterations=1,
+            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15)),
+            iterations=3,
         )
         return brain_mask
 
     def _build_high_intensity_mask(self, image: np.ndarray, brain_mask: np.ndarray) -> np.ndarray:
         high_intensity_mask = np.zeros_like(image, dtype=np.uint8)
-        inside_brain = image[brain_mask > 0]
-        if inside_brain.size == 0:
+        
+        # Apply bilateral filter to smooth noise
+        blurred = cv2.bilateralFilter(image, 9, 75, 75)
+        inside_brain = blurred[brain_mask > 0]
+        
+        if inside_brain.size < 100:
             return high_intensity_mask
 
-        threshold_value = float(np.percentile(inside_brain, 97.0))
-        high_intensity_mask[(image >= threshold_value) & (brain_mask > 0)] = 255
+        # Apply k-means (k=3) on the brain pixels
+        pixel_values = inside_brain.reshape((-1, 1)).astype(np.float32)
+        criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 100, 0.2)
+        _, labels, centers = cv2.kmeans(pixel_values, 3, None, criteria, 10, cv2.KMEANS_RANDOM_CENTERS)
+        
+        brightest_cluster = np.argmax(centers)
+        threshold_value = float(np.min(pixel_values[labels == brightest_cluster]))
+        
+        # Additional safety to prevent choosing background
+        if threshold_value < 50:
+            threshold_value = float(np.percentile(inside_brain, 95.0))
+            
+        high_intensity_mask[(blurred >= threshold_value) & (brain_mask > 0)] = 255
         return high_intensity_mask
 
     def _postprocess_mask(
@@ -164,7 +185,7 @@ class SegmentationService:
 
         for label_index in range(1, component_count):
             area = int(stats[label_index, cv2.CC_STAT_AREA])
-            if area < 200 or area > int(image_area * 0.30):
+            if area < 200 or area > int(image_area * 0.10):
                 continue
 
             x = int(stats[label_index, cv2.CC_STAT_LEFT])
@@ -213,7 +234,7 @@ class SegmentationService:
             and (x + width) >= (mask.shape[1] - 2)
             and (y + height) >= (mask.shape[0] - 2)
         )
-        if area < 200.0 or area > image_area * 0.30 or touches_full_border:
+        if area < 200.0 or area > image_area * 0.10 or touches_full_border:
             return np.zeros_like(mask, dtype=np.uint8)
 
         validated = np.zeros_like(mask, dtype=np.uint8)
@@ -264,32 +285,21 @@ class SegmentationService:
 
     def _smooth_contour(self, contour: np.ndarray) -> Optional[np.ndarray]:
         points = contour.reshape(-1, 2).astype(np.float32)
-        point_count = len(points)
-        if point_count < 3:
+        if len(points) < 3:
             return None
-        if point_count < 5:
-            return contour.astype(np.int32)
-
-        kernel_size = min(11, point_count if point_count % 2 == 1 else point_count - 1)
-        if kernel_size < 3:
-            return contour.astype(np.int32)
-        if kernel_size % 2 == 0:
-            kernel_size -= 1
-
-        radius = kernel_size // 2
-        gaussian_kernel = cv2.getGaussianKernel(kernel_size, 2.5).flatten()
-        padded_points = np.vstack([points[-radius:], points, points[:radius]])
-        smooth_x = np.convolve(padded_points[:, 0], gaussian_kernel, mode="valid")
-        smooth_y = np.convolve(padded_points[:, 1], gaussian_kernel, mode="valid")
-        smoothed_points = np.stack([smooth_x, smooth_y], axis=1)
-        return smoothed_points.reshape(-1, 1, 2).astype(np.int32)
+            
+        # Use a very light polygon approximation to smooth jagged edges 
+        # without ballooning or distorting the pixel-perfect GrabCut boundary
+        epsilon = 0.002 * cv2.arcLength(contour, True)
+        approx = cv2.approxPolyDP(contour, epsilon, True)
+        return approx.astype(np.int32)
 
     def _draw_overlay(self, image: np.ndarray, contour: Optional[np.ndarray]) -> np.ndarray:
         overlay = image.copy()
         if contour is None or len(contour) == 0:
             return overlay
 
-        cv2.drawContours(overlay, [contour], -1, (0, 255, 0), 2, lineType=cv2.LINE_AA)
+        cv2.drawContours(overlay, [contour], -1, (0, 0, 255), 2, lineType=cv2.LINE_AA)
         return overlay
 
     def _get_bbox(self, mask: np.ndarray) -> Optional[Dict[str, int]]:
